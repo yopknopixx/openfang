@@ -5,7 +5,8 @@
 
 use crate::formatter;
 use crate::router::AgentRouter;
-use crate::types::{ChannelAdapter, ChannelContent, ChannelMessage, ChannelUser};
+use crate::types::{
+    RichBlock,ChannelAdapter, ChannelContent, ChannelMessage, ChannelUser};
 use async_trait::async_trait;
 use dashmap::DashMap;
 use futures::StreamExt;
@@ -337,6 +338,616 @@ fn channel_type_str(channel: &crate::types::ChannelType) -> &str {
     }
 }
 
+
+/// Parse agent response text for rich content markers (:::embed, :::buttons, :::gallery).
+/// Returns Rich content for Discord, plain text for other channels.
+fn parse_rich_content(text: &str, channel_type: &str) -> ChannelContent {
+    if channel_type != "discord" {
+        return ChannelContent::Text(strip_rich_markers(text));
+    }
+
+    // First try explicit :::embed markup
+    let has_explicit_markers = text.contains(":::embed") || text.contains(":::buttons")
+        || text.contains(":::gallery") || text.contains(":::section");
+
+    if has_explicit_markers {
+        let blocks = parse_rich_blocks(text);
+        if !blocks.is_empty() {
+            let fallback = strip_rich_markers(text);
+            tracing::info!(block_count = blocks.len(), "Rich content: parsed explicit markers");
+            return ChannelContent::Rich { blocks, fallback_text: fallback };
+        }
+    }
+
+    // Fallback: auto-convert markdown structure to embeds for Discord
+    let blocks = auto_markdown_to_embeds(text);
+    if !blocks.is_empty() {
+        tracing::info!(block_count = blocks.len(), "Rich content: auto-converted from markdown");
+        return ChannelContent::Rich {
+            blocks,
+            fallback_text: text.to_string(),
+        };
+    }
+
+    ChannelContent::Text(text.to_string())
+}
+
+
+/// Auto-convert markdown-structured text to RichBlock embeds for Discord.
+/// Splits on ## headers and --- separators. Cleans up pipe-separated tables
+/// into readable Discord markdown within embed descriptions.
+fn auto_markdown_to_embeds(text: &str) -> Vec<RichBlock> {
+    let has_headers = text.contains("## ") || text.contains("### ");
+    let line_count = text.lines().count();
+
+    if line_count < 5 || !has_headers {
+        return Vec::new();
+    }
+
+    let mut blocks: Vec<RichBlock> = Vec::new();
+    let mut current_title: Option<String> = None;
+    let mut current_lines: Vec<String> = Vec::new();
+    let mut current_color: Option<u32> = None;
+    let mut in_code_block = false;
+
+    let flush_embed = |title: &mut Option<String>,
+                       lines: &mut Vec<String>,
+                       color: &mut Option<u32>,
+                       blocks: &mut Vec<RichBlock>| {
+        if title.is_none() && lines.is_empty() {
+            return;
+        }
+        let raw_desc = lines.join("\n").trim().to_string();
+        // Clean up tables in the description
+        let desc = clean_tables_in_text(&raw_desc);
+        let desc_safe = if desc.len() > 4000 {
+            let mut e = 4000;
+            while e > 0 && !desc.is_char_boundary(e) { e -= 1; }
+            format!("{}...", &desc[..e])
+        } else {
+            desc
+        };
+        if title.is_some() || !desc_safe.is_empty() {
+            blocks.push(RichBlock::Embed {
+                title: title.take(),
+                description: desc_safe,
+                color: color.take().or(Some(0x5865F2)),
+                fields: Vec::new(),
+                image_url: None,
+                footer: None,
+            });
+        }
+        lines.clear();
+    };
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+
+        // Track code blocks
+        if trimmed.starts_with("```") {
+            in_code_block = !in_code_block;
+            // Don't include code block markers in embed descriptions
+            continue;
+        }
+
+        if in_code_block {
+            current_lines.push(line.to_string());
+            continue;
+        }
+
+        // ## or ### headers -> new embed
+        if trimmed.starts_with("## ") || trimmed.starts_with("### ") {
+            flush_embed(&mut current_title, &mut current_lines, &mut current_color, &mut blocks);
+            let title_text = trimmed.trim_start_matches('#').trim().to_string();
+            current_color = guess_embed_color(&title_text);
+            current_title = Some(title_text);
+            continue;
+        }
+
+        // --- separator -> flush embed
+        if trimmed == "---" || trimmed == "***" || trimmed == "___" {
+            flush_embed(&mut current_title, &mut current_lines, &mut current_color, &mut blocks);
+            continue;
+        }
+
+        current_lines.push(line.to_string());
+    }
+
+    flush_embed(&mut current_title, &mut current_lines, &mut current_color, &mut blocks);
+
+    if blocks.len() <= 1 {
+        if let Some(RichBlock::Embed { title, description, .. }) = blocks.first() {
+            if title.is_none() && description.is_empty() {
+                return Vec::new();
+            }
+        }
+    }
+
+    blocks
+}
+
+/// Clean up pipe-separated tables in text for Discord embed rendering.
+/// - Strips separator rows (------|------|------)
+/// - Strips header rows (they're implied by the bold formatting below)
+/// - Converts data rows like "Name | Date | Location" into:
+///   **Name** — Date | Location
+fn clean_tables_in_text(text: &str) -> String {
+    let mut result = Vec::new();
+    let mut table_headers: Vec<String> = Vec::new();
+    let mut in_table = false;
+    let mut pending_header: Option<String> = None;
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+
+        // Detect separator rows and skip them
+        let is_separator = is_table_separator(trimmed);
+        if is_separator {
+            // The line before this was the header row
+            if let Some(header_line) = pending_header.take() {
+                let cells: Vec<&str> = header_line.split('|')
+                    .map(|c| c.trim())
+                    .filter(|c| !c.is_empty())
+                    .collect();
+                table_headers = cells.iter().map(|c| c.to_string()).collect();
+            }
+            in_table = true;
+            continue;
+        }
+
+        // Check if this is a pipe-separated row
+        let pipe_count = trimmed.matches('|').count();
+        let looks_like_table_row = pipe_count >= 2 && !trimmed.starts_with("> ");
+
+        if looks_like_table_row {
+            if !in_table {
+                // This might be a header row — hold it
+                pending_header = Some(trimmed.to_string());
+                continue;
+            }
+
+            // Data row — format nicely
+            let cells: Vec<&str> = trimmed.split('|')
+                .map(|c| c.trim())
+                .filter(|c| !c.is_empty())
+                .collect();
+
+            if cells.is_empty() {
+                continue;
+            }
+
+            // First cell becomes bold, rest joined with " · "
+            let name = cells[0].to_string();
+            if cells.len() == 1 {
+                result.push(format!("**{}**", name));
+            } else {
+                let details: Vec<String> = cells[1..].iter().enumerate().map(|(i, cell)| {
+                    // If we have headers, prefix with header name for important fields
+                    if i + 1 < table_headers.len() && !table_headers[i + 1].is_empty() {
+                        let header = &table_headers[i + 1];
+                        let h_lower = header.to_lowercase();
+                        // Only prefix if the header adds useful context
+                        if h_lower == "date" || h_lower == "cost" || h_lower == "price" || h_lower == "location" {
+                            return format!("{}: {}", header, cell);
+                        }
+                    }
+                    cell.to_string()
+                }).collect();
+                result.push(format!("**{}** — {}", name, details.join(" · ")));
+            }
+            continue;
+        }
+
+        // Not a table row
+        if in_table {
+            in_table = false;
+            table_headers.clear();
+        }
+        // If we were holding a pending header that wasn't followed by a separator,
+        // it wasn't actually a header — emit it as normal text
+        if let Some(header_line) = pending_header.take() {
+            result.push(header_line);
+        }
+        result.push(line.to_string());
+    }
+
+    // Flush any remaining pending header
+    if let Some(header_line) = pending_header {
+        result.push(header_line);
+    }
+
+    result.join("\n")
+}
+
+/// Check if a line is a table separator (------|------|------).
+fn is_table_separator(line: &str) -> bool {
+    if line.is_empty() || line.len() < 3 {
+        return false;
+    }
+    // Must be mostly dashes/pipes/colons/spaces
+    let valid_chars = line.chars().all(|c| c == '-' || c == '|' || c == ' ' || c == ':' || c == '=' || c == '+');
+    valid_chars && line.contains('-') && line.len() >= 5
+}
+
+/// Unwrap code blocks that contain markdown tables.
+fn unwrap_code_block_tables(text: &str) -> String {
+    let mut result = String::new();
+    let mut in_code_block = false;
+    let mut code_block_lines: Vec<String> = Vec::new();
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("```") {
+            if in_code_block {
+                let has_table = code_block_lines.iter().any(|l| {
+                    l.trim().matches('|').count() >= 2
+                });
+                if has_table {
+                    for cl in &code_block_lines {
+                        result.push_str(cl);
+                        result.push('\n');
+                    }
+                } else {
+                    result.push_str("```\n");
+                    for cl in &code_block_lines {
+                        result.push_str(cl);
+                        result.push('\n');
+                    }
+                    result.push_str("```\n");
+                }
+                code_block_lines.clear();
+                in_code_block = false;
+            } else {
+                in_code_block = true;
+                code_block_lines.clear();
+            }
+            continue;
+        }
+
+        if in_code_block {
+            code_block_lines.push(line.to_string());
+        } else {
+            result.push_str(line);
+            result.push('\n');
+        }
+    }
+
+    if in_code_block {
+        result.push_str("```\n");
+        for cl in &code_block_lines {
+            result.push_str(cl);
+            result.push('\n');
+        }
+    }
+
+    result
+}
+
+/// Guess a Discord embed color from title text (emoji/keywords).
+fn guess_embed_color(title: &str) -> Option<u32> {
+    let lower = title.to_lowercase();
+    // Red/negative indicators
+    if lower.contains("alert") || lower.contains("warning") || lower.contains("error")
+        || lower.contains("risk") || lower.contains("down") || lower.contains("loss")
+        || title.contains('\u{1F534}') || title.contains('\u{26A0}') // 🔴 ⚠
+    {
+        return Some(0xED4245); // Discord red
+    }
+    // Green/positive indicators
+    if lower.contains("success") || lower.contains("profit") || lower.contains("gain")
+        || lower.contains("up") || lower.contains("positive") || lower.contains("complete")
+        || title.contains('\u{1F7E2}') || title.contains('\u{2705}') // 🟢 ✅
+    {
+        return Some(0x57F287); // Discord green
+    }
+    // Gold/info indicators
+    if lower.contains("summary") || lower.contains("overview") || lower.contains("report")
+        || lower.contains("key") || lower.contains("takeaway") || lower.contains("highlight")
+        || title.contains('\u{1F4CA}') || title.contains('\u{1F9E0}') // 📊 🧠
+    {
+        return Some(0xFEE75C); // Discord yellow
+    }
+    // Blue for market/data/macro
+    if lower.contains("market") || lower.contains("data") || lower.contains("macro")
+        || lower.contains("sector") || lower.contains("index") || lower.contains("stock")
+        || lower.contains("crypto") || lower.contains("alternative")
+        || title.contains('\u{1F310}') || title.contains('\u{1F4C8}') // 🌐 📈
+    {
+        return Some(0x5865F2); // Discord blurple
+    }
+
+    None // Default will be set to blurple in flush_embed
+}
+
+/// Strip :::marker::: blocks from text, leaving inner content as plain text.
+fn strip_rich_markers(text: &str) -> String {
+    let mut result = String::new();
+    let mut in_block = false;
+    let mut block_content = String::new();
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if !in_block && (trimmed.starts_with(":::embed") || trimmed.starts_with(":::buttons") || trimmed.starts_with(":::gallery") || trimmed.starts_with(":::section")) {
+            in_block = true;
+            block_content.clear();
+            continue;
+        }
+        if in_block && trimmed == ":::" {
+            in_block = false;
+            // Include the inner content as plain text
+            if !block_content.trim().is_empty() {
+                result.push_str(block_content.trim());
+                result.push('\n');
+            }
+            continue;
+        }
+        if in_block {
+            block_content.push_str(line);
+            block_content.push('\n');
+        } else {
+            result.push_str(line);
+            result.push('\n');
+        }
+    }
+
+    result.trim_end().to_string()
+}
+
+/// Parse rich block markers from agent text into structured RichBlock types.
+fn parse_rich_blocks(text: &str) -> Vec<RichBlock> {
+    let mut blocks: Vec<RichBlock> = Vec::new();
+    let mut current_text = String::new();
+    let mut in_block = false;
+    let mut block_type = String::new();
+    let mut block_attrs = String::new();
+    let mut block_content = String::new();
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+
+        if !in_block {
+            // Check for block start markers
+            if trimmed.starts_with(":::embed") {
+                if !current_text.trim().is_empty() {
+                    blocks.push(RichBlock::PlainText(current_text.trim().to_string()));
+                    current_text.clear();
+                }
+                in_block = true;
+                block_type = "embed".to_string();
+                block_attrs = trimmed.strip_prefix(":::embed").unwrap_or("").trim().to_string();
+                block_content.clear();
+            } else if trimmed.starts_with(":::buttons") {
+                if !current_text.trim().is_empty() {
+                    blocks.push(RichBlock::PlainText(current_text.trim().to_string()));
+                    current_text.clear();
+                }
+                in_block = true;
+                block_type = "buttons".to_string();
+                block_content.clear();
+            } else if trimmed.starts_with(":::gallery") {
+                if !current_text.trim().is_empty() {
+                    blocks.push(RichBlock::PlainText(current_text.trim().to_string()));
+                    current_text.clear();
+                }
+                in_block = true;
+                block_type = "gallery".to_string();
+                block_content.clear();
+            } else if trimmed.starts_with(":::section") {
+                if !current_text.trim().is_empty() {
+                    blocks.push(RichBlock::PlainText(current_text.trim().to_string()));
+                    current_text.clear();
+                }
+                in_block = true;
+                block_type = "section".to_string();
+                block_attrs = trimmed.strip_prefix(":::section").unwrap_or("").trim().to_string();
+                block_content.clear();
+            } else {
+                current_text.push_str(line);
+                current_text.push('\n');
+            }
+        } else if trimmed == ":::" {
+            // End of block
+            in_block = false;
+            match block_type.as_str() {
+                "embed" => blocks.push(parse_embed_block(&block_attrs, &block_content)),
+                "buttons" => blocks.push(parse_buttons_block(&block_content)),
+                "gallery" => blocks.push(parse_gallery_block(&block_content)),
+                "section" => blocks.push(parse_section_block(&block_attrs, &block_content)),
+                _ => {}
+            }
+        } else {
+            block_content.push_str(line);
+            block_content.push('\n');
+        }
+    }
+
+    // Remaining text
+    if !current_text.trim().is_empty() {
+        blocks.push(RichBlock::PlainText(current_text.trim().to_string()));
+    }
+
+    blocks
+}
+
+/// Parse an :::embed block into a RichBlock::Embed.
+fn parse_embed_block(attrs: &str, content: &str) -> RichBlock {
+    // Parse attrs: title="..." color=blue/red/green/0xFF0000
+    let title = extract_attr(attrs, "title");
+    let color_str = extract_attr(attrs, "color");
+    let color = color_str.as_deref().and_then(parse_color);
+
+    // Parse content for field tables: | Name | Value |
+    let mut description_lines = Vec::new();
+    let mut fields: Vec<(String, String, bool)> = Vec::new();
+    let mut footer: Option<String> = None;
+    let mut image_url: Option<String> = None;
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        // Check for image: ![alt](url)
+        if trimmed.starts_with("![") {
+            if let Some(url) = extract_image_url(trimmed) {
+                image_url = Some(url);
+                continue;
+            }
+        }
+        // Check for field table row: | Key | Value |
+        if trimmed.starts_with('|') && trimmed.ends_with('|') {
+            let cells: Vec<&str> = trimmed.split('|')
+                .map(|c| c.trim())
+                .filter(|c| !c.is_empty())
+                .collect();
+            // Skip separator rows (|---|---|)
+            if cells.len() >= 2 && !cells[0].chars().all(|c| c == '-' || c == ':' || c == ' ') {
+                fields.push((cells[0].to_string(), cells[1].to_string(), true));
+                continue;
+            }
+        }
+        description_lines.push(line);
+    }
+
+    let description = description_lines.join("\n").trim().to_string();
+
+    RichBlock::Embed {
+        title,
+        description,
+        color,
+        fields,
+        image_url,
+        footer,
+    }
+}
+
+/// Parse a :::buttons block into RichBlock::Buttons.
+fn parse_buttons_block(content: &str) -> RichBlock {
+    let mut buttons: Vec<(String, String)> = Vec::new();
+    let mut text_lines: Vec<&str> = Vec::new();
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        // Match [Label](btn:custom_id)
+        if trimmed.starts_with('[') && trimmed.contains("](btn:") {
+            if let Some((label, id)) = parse_button_link(trimmed) {
+                buttons.push((label, id));
+                continue;
+            }
+        }
+        if !trimmed.is_empty() {
+            text_lines.push(trimmed);
+        }
+    }
+
+    RichBlock::Buttons {
+        text: text_lines.join(" "),
+        buttons,
+    }
+}
+
+/// Parse a :::gallery block into RichBlock::ImageGallery.
+fn parse_gallery_block(content: &str) -> RichBlock {
+    let mut images: Vec<(String, Option<String>)> = Vec::new();
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        // Match ![caption](url) or ![caption](url "title")
+        if trimmed.starts_with("![") {
+            if let Some(url) = extract_image_url(trimmed) {
+                let caption = extract_image_alt(trimmed);
+                images.push((url, caption));
+            }
+        }
+    }
+
+    RichBlock::ImageGallery { images }
+}
+
+/// Parse a :::section block into RichBlock::Section.
+fn parse_section_block(attrs: &str, content: &str) -> RichBlock {
+    let thumbnail_url = extract_attr(attrs, "thumbnail");
+    RichBlock::Section {
+        text: content.trim().to_string(),
+        thumbnail_url,
+    }
+}
+
+/// Extract a named attribute from a string like: title="Hello" color=blue
+fn extract_attr(attrs: &str, name: &str) -> Option<String> {
+    let pattern = format!("{}=\"", name);
+    if let Some(start) = attrs.find(&pattern) {
+        let val_start = start + pattern.len();
+        if let Some(end) = attrs[val_start..].find('"') {
+            return Some(attrs[val_start..val_start + end].to_string());
+        }
+    }
+    // Try without quotes: color=blue
+    let pattern2 = format!("{}=", name);
+    if let Some(start) = attrs.find(&pattern2) {
+        let val_start = start + pattern2.len();
+        let end = attrs[val_start..].find(' ').unwrap_or(attrs[val_start..].len());
+        let val = attrs[val_start..val_start + end].trim_matches('"');
+        if !val.is_empty() {
+            return Some(val.to_string());
+        }
+    }
+    None
+}
+
+/// Parse a color name or hex value to u32.
+fn parse_color(color: &str) -> Option<u32> {
+    match color.to_lowercase().as_str() {
+        "blue" | "blurple" => Some(0x5865F2),
+        "green" | "success" => Some(0x57F287),
+        "red" | "danger" | "error" => Some(0xED4245),
+        "yellow" | "warning" => Some(0xFEE75C),
+        "grey" | "gray" => Some(0x99AAB5),
+        "white" => Some(0xFFFFFF),
+        "black" => Some(0x23272A),
+        "orange" => Some(0xE67E22),
+        "purple" => Some(0x9B59B6),
+        "teal" => Some(0x1ABC9C),
+        s if s.starts_with("0x") => u32::from_str_radix(&s[2..], 16).ok(),
+        s if s.starts_with('#') => u32::from_str_radix(&s[1..], 16).ok(),
+        _ => None,
+    }
+}
+
+/// Extract URL from ![alt](url) or ![alt](url "title").
+fn extract_image_url(s: &str) -> Option<String> {
+    let paren_start = s.find("](")? + 2;
+    let paren_end = s.rfind(')')?;
+    let inner = s[paren_start..paren_end].trim();
+    // May have "title" at the end
+    let url = if inner.contains('"') {
+        inner.split('"').next().unwrap_or(inner).trim()
+    } else {
+        inner
+    };
+    if url.starts_with("http") {
+        Some(url.to_string())
+    } else {
+        None
+    }
+}
+
+/// Extract alt text from ![alt](url).
+fn extract_image_alt(s: &str) -> Option<String> {
+    let start = s.find("![")? + 2;
+    let end = s.find("](")?;
+    let alt = s[start..end].trim();
+    if alt.is_empty() { None } else { Some(alt.to_string()) }
+}
+
+/// Extract button label and ID from [Label](btn:custom_id).
+fn parse_button_link(s: &str) -> Option<(String, String)> {
+    let label_start = s.find('[')? + 1;
+    let label_end = s.find("](")?;
+    let id_start = s.find("](btn:")? + 6;
+    let id_end = s.rfind(')')?;
+    let label = s[label_start..label_end].to_string();
+    let id = s[id_start..id_end].to_string();
+    Some((label, id))
+}
+
 /// Send a response, applying output formatting and optional threading.
 async fn send_response(
     adapter: &dyn ChannelAdapter,
@@ -344,9 +955,27 @@ async fn send_response(
     text: String,
     thread_id: Option<&str>,
     output_format: OutputFormat,
+    channel_type: &str,
 ) {
     let formatted = formatter::format_for_channel(&text, output_format);
-    let content = ChannelContent::Text(formatted);
+    let has_rich_markers = formatted.contains(":::embed") || formatted.contains(":::buttons") || formatted.contains(":::gallery");
+    tracing::debug!(
+        channel_type = channel_type,
+        has_rich_markers = has_rich_markers,
+        text_len = formatted.len(),
+        text_preview = &formatted[..formatted.len().min(200)],
+        "send_response: raw text before rich parsing"
+    );
+    let content = parse_rich_content(&formatted, channel_type);
+    match &content {
+        ChannelContent::Rich { blocks, .. } => {
+            tracing::info!(block_count = blocks.len(), "send_response: parsed as Rich content");
+        }
+        ChannelContent::Text(t) => {
+            tracing::debug!(text_len = t.len(), "send_response: parsed as plain Text");
+        }
+        _ => {}
+    }
 
     let result = if let Some(tid) = thread_id {
         adapter.send_in_thread(user, content, tid).await
@@ -376,6 +1005,7 @@ async fn dispatch_message(
     let channel_default_format = match ct_str {
         "telegram" => OutputFormat::TelegramHtml,
         "slack" => OutputFormat::SlackMrkdwn,
+        "discord" => OutputFormat::DiscordMarkdown,
         _ => OutputFormat::Markdown,
     };
     let output_format = overrides
@@ -407,15 +1037,8 @@ async fn dispatch_message(
                     }
                 }
                 GroupPolicy::MentionOnly => {
-                    // Only allow messages where the bot was @mentioned or commands.
-                    let was_mentioned = message.metadata.get("was_mentioned")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false);
-                    let is_command = matches!(&message.content, ChannelContent::Command { .. });
-                    if !was_mentioned && !is_command {
-                        debug!("Ignoring group message on {ct_str} (group_policy=mention_only, not mentioned)");
-                        return;
-                    }
+                    // Pass through — adapters should only forward mentioned messages.
+                    // This is a hint for adapters, not enforced here.
                 }
                 GroupPolicy::All => {}
             }
@@ -440,7 +1063,7 @@ async fn dispatch_message(
             if let Err(msg) =
                 rate_limiter.check(ct_str, &message.sender.platform_id, ov.rate_limit_per_user)
             {
-                send_response(adapter, &message.sender, msg, thread_id, output_format).await;
+                send_response(adapter, &message.sender, msg, thread_id, output_format, ct_str).await;
                 return;
             }
         }
@@ -450,16 +1073,28 @@ async fn dispatch_message(
         ChannelContent::Text(t) => t.clone(),
         ChannelContent::Command { name, args } => {
             let result = handle_command(name, args, handle, router, &message.sender).await;
-            send_response(adapter, &message.sender, result, thread_id, output_format).await;
+            send_response(adapter, &message.sender, result, thread_id, output_format, ct_str).await;
             return;
+        }
+        ChannelContent::Image { url, caption } => {
+            let cap = caption.as_deref().unwrap_or("");
+            if cap.is_empty() {
+                format!("[Image: {}]", url)
+            } else {
+                format!("{} [Image: {}]", cap, url)
+            }
+        }
+        ChannelContent::File { url, filename } => {
+            format!("[File: {} - {}]", filename, url)
         }
         _ => {
             send_response(
                 adapter,
                 &message.sender,
-                "I can only handle text messages for now.".to_string(),
+                "I can only handle text and file messages for now.".to_string(),
                 thread_id,
                 output_format,
+                ct_str,
             )
             .await;
             return;
@@ -507,7 +1142,7 @@ async fn dispatch_message(
                 | "a2a"
         ) {
             let result = handle_command(cmd, &args, handle, router, &message.sender).await;
-            send_response(adapter, &message.sender, result, thread_id, output_format).await;
+            send_response(adapter, &message.sender, result, thread_id, output_format, ct_str).await;
             return;
         }
         // Other slash commands pass through to the agent
@@ -528,6 +1163,7 @@ async fn dispatch_message(
                     format!("Access denied: {denied}"),
                     thread_id,
                     output_format,
+                    ct_str,
                 )
                 .await;
                 return;
@@ -574,7 +1210,7 @@ async fn dispatch_message(
             }
 
             let combined = responses.join("\n\n");
-            send_response(adapter, &message.sender, combined, thread_id, output_format).await;
+            send_response(adapter, &message.sender, combined, thread_id, output_format, ct_str).await;
             return;
         }
     }
@@ -589,33 +1225,15 @@ async fn dispatch_message(
     let agent_id = match agent_id {
         Some(id) => id,
         None => {
-            // Fallback: try "assistant" agent, then first available agent
-            let fallback = handle.find_agent_by_name("assistant").await.ok().flatten();
-            let fallback = match fallback {
-                Some(id) => Some(id),
-                None => handle
-                    .list_agents()
-                    .await
-                    .ok()
-                    .and_then(|agents| agents.first().map(|(id, _)| *id)),
-            };
-            match fallback {
-                Some(id) => {
-                    // Auto-set this as the user's default so future messages route directly
-                    router.set_user_default(message.sender.platform_id.clone(), id);
-                    id
-                }
-                None => {
-                    send_response(
-                        adapter,
-                        &message.sender,
-                        "No agents available. Start the dashboard at http://127.0.0.1:4200 to create one.".to_string(),
-                        thread_id,
-                        output_format,
-                    ).await;
-                    return;
-                }
-            }
+            send_response(
+                adapter,
+                &message.sender,
+                "No agent assigned. Use /agents to list available agents, then /agent <name> to select one.".to_string(),
+                thread_id,
+                output_format,
+                ct_str,
+            ).await;
+            return;
         }
     };
 
@@ -630,6 +1248,7 @@ async fn dispatch_message(
             format!("Access denied: {denied}"),
             thread_id,
             output_format,
+            ct_str,
         )
         .await;
         return;
@@ -638,7 +1257,7 @@ async fn dispatch_message(
     // Auto-reply check — if enabled, the engine decides whether to process this message.
     // If auto-reply is enabled but suppressed for this message, skip agent call entirely.
     if let Some(reply) = handle.check_auto_reply(agent_id, &text).await {
-        send_response(adapter, &message.sender, reply, thread_id, output_format).await;
+        send_response(adapter, &message.sender, reply, thread_id, output_format, ct_str).await;
         handle
             .record_delivery(agent_id, ct_str, &message.sender.platform_id, true, None)
             .await;
@@ -651,7 +1270,7 @@ async fn dispatch_message(
     // Send to agent and relay response
     match handle.send_message(agent_id, &text).await {
         Ok(response) => {
-            send_response(adapter, &message.sender, response, thread_id, output_format).await;
+            send_response(adapter, &message.sender, response, thread_id, output_format, ct_str).await;
             handle
                 .record_delivery(agent_id, ct_str, &message.sender.platform_id, true, None)
                 .await;
@@ -665,6 +1284,7 @@ async fn dispatch_message(
                 err_msg.clone(),
                 thread_id,
                 output_format,
+                ct_str,
             )
             .await;
             handle

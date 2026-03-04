@@ -143,3 +143,10 @@ lto = true
 codegen-units = 1
 strip = true
 opt-level = 3
+
+# Fast release build for development iteration
+[profile.dev-release]
+inherits = "release"
+lto = "thin"
+codegen-units = 8
+strip = false

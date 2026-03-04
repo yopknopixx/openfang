@@ -12,7 +12,7 @@
 
 use crate::types::{
     split_message, ChannelAdapter, ChannelContent, ChannelMessage, ChannelType, ChannelUser,
-    AgentPhase, default_phase_emoji, LifecycleReaction, RichBlock,
+    AgentPhase, default_phase_emoji, LifecycleReaction,
 };
 use async_trait::async_trait;
 use dashmap::DashMap;
@@ -131,17 +131,8 @@ mod discord_types {
 
 /// Voice module (Phase 5 foundation).
 mod voice {
-    use songbird::{Config as SongbirdConfig, driver::{DecodeMode, Driver}};
-    use songbird::events::{Event, EventContext, EventHandler as SongbirdEventHandler, CoreEvent};
-    use songbird::id::{ChannelId, GuildId, UserId};
-    use songbird::input::File as AudioFile;
-    use songbird::ConnectionInfo;
-    use std::collections::HashMap;
-    use std::num::NonZeroU64;
-    use std::sync::Arc;
-    use tokio::sync::mpsc;
-    use tracing::{debug, error, info, warn};
 
+    /// Voice gateway opcodes.
     pub mod voice_opcode {
         pub const IDENTIFY: u64 = 0;
         pub const SELECT_PROTOCOL: u64 = 1;
@@ -156,18 +147,8 @@ mod voice {
         pub const CLIENT_DISCONNECT: u64 = 13;
     }
 
-    /// Track voice state for users in channels.
-    #[derive(Debug, Clone)]
-    pub struct VoiceState {
-        pub user_id: String,
-        pub channel_id: Option<String>,
-        pub guild_id: String,
-        pub self_mute: bool,
-        pub self_deaf: bool,
-    }
-
     /// Represents a pending or active voice connection.
-    #[derive(Debug, Clone)]
+    #[derive(Debug)]
     pub struct VoiceConnection {
         pub guild_id: String,
         pub channel_id: String,
@@ -194,201 +175,14 @@ mod voice {
         }
     }
 
-    /// Event sent when a user finishes speaking and audio is ready for processing.
-    #[derive(Debug)]
-    pub struct AudioCompleteEvent {
-        pub ssrc: u32,
-        pub user_id: Option<u64>,
-        pub samples: Vec<i16>,
-    }
-
-    /// Manages audio reception from voice channels.
-    /// Buffers decoded PCM per SSRC, flushes when a user stops speaking.
-    pub struct AudioReceiver {
-        /// PCM buffers keyed by SSRC
-        buffers: Arc<parking_lot::Mutex<HashMap<u32, Vec<i16>>>>,
-        /// SSRC → UserId mapping (learned from SpeakingStateUpdate)
-        ssrc_map: Arc<parking_lot::Mutex<HashMap<u32, u64>>>,
-        /// Channel to send completed audio buffers for processing
-        tx: mpsc::UnboundedSender<AudioCompleteEvent>,
-    }
-
-    impl AudioReceiver {
-        pub fn new(tx: mpsc::UnboundedSender<AudioCompleteEvent>) -> Self {
-            Self {
-                buffers: Arc::new(parking_lot::Mutex::new(HashMap::new())),
-                ssrc_map: Arc::new(parking_lot::Mutex::new(HashMap::new())),
-                tx,
-            }
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl SongbirdEventHandler for AudioReceiver {
-        async fn act(&self, ctx: &EventContext<'_>) -> Option<Event> {
-            match ctx {
-                EventContext::VoiceTick(tick) => {
-                    // Accumulate decoded PCM for each speaking user
-                    for (&ssrc, voice_data) in tick.speaking.iter() {
-                        if let Some(ref decoded) = voice_data.decoded_voice {
-                            if !decoded.is_empty() {
-                                let mut bufs = self.buffers.lock();
-                                bufs.entry(ssrc)
-                                    .or_insert_with(Vec::new)
-                                    .extend_from_slice(decoded);
-                            }
-                        }
-                    }
-                    None
-                }
-                EventContext::SpeakingStateUpdate(speaking) => {
-                    // Map SSRC to user ID
-                    if let Some(uid) = speaking.user_id {
-                        let mut map = self.ssrc_map.lock();
-                        map.insert(speaking.ssrc, uid.0);
-                    }
-
-                    // When user stops speaking (microphone flag cleared), flush their buffer
-                    if !speaking.speaking.microphone() {
-                        let ssrc = speaking.ssrc;
-                        let mut bufs = self.buffers.lock();
-                        if let Some(samples) = bufs.remove(&ssrc) {
-                            // Only process if we have meaningful audio (>200ms at 48kHz stereo)
-                            if samples.len() > 48000 * 2 / 5 {
-                                let user_id = {
-                                    let map = self.ssrc_map.lock();
-                                    map.get(&ssrc).copied()
-                                };
-                                let _ = self.tx.send(AudioCompleteEvent {
-                                    ssrc,
-                                    user_id,
-                                    samples,
-                                });
-                            }
-                        }
-                    }
-                    None
-                }
-                EventContext::ClientDisconnect(dc) => {
-                    // Clean up buffers for disconnected client
-                    debug!("Voice: client disconnected, user_id={:?}", dc.user_id);
-                    None
-                }
-                _ => None,
-            }
-        }
-    }
-
-    /// Wraps a Songbird Driver for a single voice connection.
-    pub struct SongbirdVoiceManager {
-        pub driver: Driver,
-    }
-
-    impl SongbirdVoiceManager {
-        pub fn new() -> Self {
-            let config = SongbirdConfig::default()
-                .decode_mode(DecodeMode::Decode);
-
-            Self {
-                driver: Driver::new(config),
-            }
-        }
-
-        /// Connect to a Discord voice channel using the gateway-provided info.
-        pub async fn connect(
-            &mut self,
-            conn: &VoiceConnection,
-            bot_user_id: u64,
-        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-            let guild_nz = NonZeroU64::new(conn.guild_id.parse::<u64>()?)
-                .ok_or("guild_id is zero")?;
-            let channel_nz = NonZeroU64::new(conn.channel_id.parse::<u64>()?)
-                .ok_or("channel_id is zero")?;
-            let user_nz = NonZeroU64::new(bot_user_id)
-                .ok_or("bot_user_id is zero")?;
-
-            let endpoint = conn.endpoint.as_deref()
-                .ok_or("missing voice endpoint")?
-                .to_string();
-            let session_id = conn.session_id.as_deref()
-                .ok_or("missing voice session_id")?
-                .to_string();
-            let token = conn.token.as_deref()
-                .ok_or("missing voice token")?
-                .to_string();
-
-            let info = ConnectionInfo {
-                channel_id: Some(ChannelId(channel_nz)),
-                endpoint,
-                guild_id: GuildId(guild_nz),
-                session_id,
-                token,
-                user_id: UserId(user_nz),
-            };
-
-            info!("Voice: connecting to guild={}, channel={}", conn.guild_id, conn.channel_id);
-            self.driver.connect(info).await?;
-            info!("Voice: connected successfully");
-
-            Ok(())
-        }
-
-        /// Register an event handler on the driver.
-        pub fn register_event<F: SongbirdEventHandler + 'static>(
-            &mut self,
-            event: Event,
-            handler: F,
-        ) {
-            self.driver.add_global_event(event, handler);
-        }
-
-        /// Play an audio file through the voice connection.
-        pub fn play_file(&mut self, path: &str) {
-            let file = AudioFile::new(path.to_string());
-            let _handle = self.driver.play_input(file.into());
-            info!("Voice: playing audio from {path}");
-        }
-
-        /// Disconnect from voice.
-        pub fn disconnect(&mut self) {
-            self.driver.leave();
-            info!("Voice: disconnected");
-        }
-    }
-
-    /// Save raw PCM samples (48kHz stereo i16) to a WAV file.
-    pub fn save_pcm_to_wav(
-        path: &str,
-        samples: &[i16],
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        use std::io::Write;
-
-        let sample_rate: u32 = 48000;
-        let channels: u16 = 2;
-        let bits_per_sample: u16 = 16;
-        let byte_rate = sample_rate * channels as u32 * bits_per_sample as u32 / 8;
-        let block_align = channels * bits_per_sample / 8;
-        let data_size = (samples.len() as u32) * 2;
-        let file_size = 36 + data_size;
-
-        let mut f = std::fs::File::create(path)?;
-        f.write_all(b"RIFF")?;
-        f.write_all(&file_size.to_le_bytes())?;
-        f.write_all(b"WAVE")?;
-        f.write_all(b"fmt ")?;
-        f.write_all(&16u32.to_le_bytes())?;
-        f.write_all(&1u16.to_le_bytes())?;
-        f.write_all(&channels.to_le_bytes())?;
-        f.write_all(&sample_rate.to_le_bytes())?;
-        f.write_all(&byte_rate.to_le_bytes())?;
-        f.write_all(&block_align.to_le_bytes())?;
-        f.write_all(&bits_per_sample.to_le_bytes())?;
-        f.write_all(b"data")?;
-        f.write_all(&data_size.to_le_bytes())?;
-        for s in samples {
-            f.write_all(&s.to_le_bytes())?;
-        }
-        Ok(())
+    /// Track voice state for users in channels.
+    #[derive(Debug, Clone)]
+    pub struct VoiceState {
+        pub user_id: String,
+        pub channel_id: Option<String>,
+        pub guild_id: String,
+        pub self_mute: bool,
+        pub self_deaf: bool,
     }
 }
 
@@ -422,9 +216,6 @@ pub struct DiscordAdapter {
     voice_connections: Arc<DashMap<String, voice::VoiceConnection>>,
     /// Voice states keyed by user_id (Phase 5).
     voice_states: Arc<DashMap<String, voice::VoiceState>>,
-    voice_managers: Arc<DashMap<String, voice::SongbirdVoiceManager>>,
-    /// Channel for sending gateway commands (opcode 4 for voice join/leave)
-    gateway_cmd_tx: Arc<tokio::sync::RwLock<Option<tokio::sync::mpsc::UnboundedSender<String>>>>,
     /// Streaming messages state (Phase 4).
     streaming_messages: Arc<DashMap<String, StreamingState>>,
 }
@@ -445,8 +236,6 @@ impl DiscordAdapter {
             application_id: Arc::new(RwLock::new(None)),
             voice_connections: Arc::new(DashMap::new()),
             voice_states: Arc::new(DashMap::new()),
-            voice_managers: Arc::new(DashMap::new()),
-            gateway_cmd_tx: Arc::new(tokio::sync::RwLock::new(None)),
             streaming_messages: Arc::new(DashMap::new()),
         }
     }
@@ -695,357 +484,6 @@ impl DiscordAdapter {
             .send()
             .await?;
         Ok(())
-    }
-
-
-    // ============= PHASE 6: Components V2 + Rich Blocks =============
-
-    /// Send a Components V2 message. Uses the IS_COMPONENTS_V2 flag (1 << 15 = 32768).
-    /// This disables content/embeds/stickers fields — all content must be in components.
-    async fn api_send_v2(
-        &self,
-        channel_id: &str,
-        components: Vec<serde_json::Value>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let url = format!("{DISCORD_API_BASE}/channels/{channel_id}/messages");
-        let body = serde_json::json!({
-            "flags": 32768,
-            "components": components
-        });
-        let resp = self
-            .client
-            .post(&url)
-            .header("Authorization", format!("Bot {}", self.token.as_str()))
-            .json(&body)
-            .send()
-            .await?;
-        if !resp.status().is_success() {
-            let body_text = resp.text().await.unwrap_or_default();
-            warn!("Discord V2 send failed: {body_text}");
-            return Err(format!("V2 send failed: {body_text}").into());
-        }
-        Ok(())
-    }
-
-    /// Route rich blocks to the best Discord API method.
-    /// Strategy: single embed → legacy embed, buttons → legacy action rows,
-    /// mixed/complex → Components V2, with fallback to plain text.
-    async fn send_rich_blocks(
-        &self,
-        channel_id: &str,
-        blocks: &[RichBlock],
-        fallback_text: &str,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        // Classify what we have
-        let has_embed = blocks.iter().any(|b| matches!(b, RichBlock::Embed { .. }));
-        let has_buttons = blocks.iter().any(|b| matches!(b, RichBlock::Buttons { .. }));
-        let has_gallery = blocks.iter().any(|b| matches!(b, RichBlock::ImageGallery { .. }));
-        let has_section = blocks.iter().any(|b| matches!(b, RichBlock::Section { .. }));
-        let plain_blocks: Vec<&str> = blocks.iter().filter_map(|b| {
-            if let RichBlock::PlainText(t) = b { Some(t.as_str()) } else { None }
-        }).collect();
-
-        // Strategy 1: Embeds (most compatible — works on all platforms including iOS)
-        // Send each embed as a separate message for best compatibility
-        if has_embed && !has_gallery && !has_section {
-            for block in blocks {
-                match block {
-                    RichBlock::Embed { title, description, color, fields, image_url, footer } => {
-                        let mut embed = discord_types::DiscordEmbed {
-                            title: title.clone(),
-                            description: Some(description.clone()),
-                            color: *color,
-                            ..Default::default()
-                        };
-                        if !fields.is_empty() {
-                            embed.fields = fields.iter().map(|(n, v, inline)| {
-                                discord_types::EmbedField {
-                                    name: n.clone(),
-                                    value: v.clone(),
-                                    inline: Some(*inline),
-                                }
-                            }).collect();
-                        }
-                        if let Some(img) = image_url {
-                            embed.image = Some(discord_types::EmbedMedia { url: img.clone() });
-                        }
-                        if let Some(ft) = footer {
-                            embed.footer = Some(discord_types::EmbedFooter {
-                                text: ft.clone(),
-                                icon_url: None,
-                            });
-                        }
-                        // If there are buttons, send embed first, then buttons
-                        let companion_text = if !plain_blocks.is_empty() {
-                            Some(plain_blocks.join("
-"))
-                        } else {
-                            None
-                        };
-                        self.api_send_embed(channel_id, companion_text.as_deref(), &embed).await?;
-                    }
-                    RichBlock::Buttons { text, buttons } => {
-                        let components: Vec<crate::types::MessageComponent> = buttons.iter().enumerate().map(|(i, (label, id))| {
-                            crate::types::MessageComponent::Button {
-                                label: label.clone(),
-                                custom_id: id.clone(),
-                                style: if i == 0 { 1 } else { 2 }, // first button primary, rest secondary
-                            }
-                        }).collect();
-                        self.api_send_with_components(channel_id, text, &components).await?;
-                    }
-                    RichBlock::PlainText(text) => {
-                        // Already handled as companion text
-                    }
-                    _ => {}
-                }
-            }
-            return Ok(());
-        }
-
-        // Strategy 2: Buttons only — legacy action rows
-        if has_buttons && !has_embed && !has_gallery && !has_section {
-            for block in blocks {
-                match block {
-                    RichBlock::Buttons { text, buttons } => {
-                        let components: Vec<crate::types::MessageComponent> = buttons.iter().enumerate().map(|(i, (label, id))| {
-                            crate::types::MessageComponent::Button {
-                                label: label.clone(),
-                                custom_id: id.clone(),
-                                style: if i == 0 { 1 } else { 2 },
-                            }
-                        }).collect();
-                        self.api_send_with_components(channel_id, text, &components).await?;
-                    }
-                    RichBlock::PlainText(text) => {
-                        self.api_send_message(channel_id, text).await?;
-                    }
-                    _ => {}
-                }
-            }
-            return Ok(());
-        }
-
-
-
-
-        // Strategy 3: Components V2 for complex layouts
-        let mut v2_components: Vec<serde_json::Value> = Vec::new();
-
-        for block in blocks {
-            match block {
-                RichBlock::PlainText(text) => {
-                    if !text.trim().is_empty() {
-                        v2_components.push(serde_json::json!({
-                            "type": 10,
-                            "content": text
-                        }));
-                    }
-                }
-                RichBlock::Embed { title, description, color, fields, image_url, footer } => {
-                    // Wrap embed content in a Container with accent color
-                    let accent = color.unwrap_or(0x5865F2);
-                    let mut inner: Vec<serde_json::Value> = Vec::new();
-
-                    // Title + description as TextDisplay
-                    let mut md = String::new();
-                    if let Some(t) = title {
-                        md.push_str(&format!("### {}
-", t));
-                    }
-                    md.push_str(description);
-
-                    if !fields.is_empty() {
-                        md.push_str("
-
-");
-                        for (name, value, _inline) in fields {
-                            md.push_str(&format!("**{}:** {}
-", name, value));
-                        }
-                    }
-
-                    if let Some(ft) = footer {
-                        md.push_str(&format!("
--# {}", ft));
-                    }
-
-                    inner.push(serde_json::json!({
-                        "type": 10,
-                        "content": md
-                    }));
-
-                    if let Some(img) = image_url {
-                        inner.push(serde_json::json!({
-                            "type": 12,
-                            "items": [{
-                                "media": { "url": img }
-                            }]
-                        }));
-                    }
-
-                    v2_components.push(serde_json::json!({
-                        "type": 17,
-                        "accent_color": accent,
-                        "components": inner
-                    }));
-                }
-                RichBlock::Buttons { text, buttons } => {
-                    if !text.trim().is_empty() {
-                        v2_components.push(serde_json::json!({
-                            "type": 10,
-                            "content": text
-                        }));
-                    }
-                    let btns: Vec<serde_json::Value> = buttons.iter().enumerate().map(|(i, (label, id))| {
-                        serde_json::json!({
-                            "type": 2,
-                            "style": if i == 0 { 1 } else { 2 },
-                            "label": label,
-                            "custom_id": id
-                        })
-                    }).collect();
-                    v2_components.push(serde_json::json!({
-                        "type": 1,
-                        "components": btns
-                    }));
-                }
-                RichBlock::ImageGallery { images } => {
-                    let items: Vec<serde_json::Value> = images.iter().map(|(url, caption)| {
-                        let mut item = serde_json::json!({
-                            "media": { "url": url }
-                        });
-                        if let Some(cap) = caption {
-                            item["description"] = serde_json::Value::String(cap.clone());
-                        }
-                        item
-                    }).collect();
-                    v2_components.push(serde_json::json!({
-                        "type": 12,
-                        "items": items
-                    }));
-                }
-                RichBlock::Section { text, thumbnail_url } => {
-                    let mut section = serde_json::json!({
-                        "type": 9,
-                        "components": [{
-                            "type": 10,
-                            "content": text
-                        }]
-                    });
-                    if let Some(thumb) = thumbnail_url {
-                        section["accessory"] = serde_json::json!({
-                            "type": 11,
-                            "media": { "url": thumb }
-                        });
-                    }
-                    v2_components.push(section);
-                }
-            }
-        }
-
-        // Try V2 first, fallback to plain text on failure
-        let v2_ok = {
-            let result = self.api_send_v2(channel_id, v2_components).await;
-            if let Err(e) = &result {
-                warn!("Discord V2 failed ({e}), falling back to plain text");
-            }
-            result.is_ok()
-        }; // v2_result dropped here, before next await
-        if v2_ok {
-            return Ok(());
-        }
-
-        // V2 failed — fallback: send each block as individual legacy embed
-        let mut any_sent = false;
-        for block in blocks {
-            match block {
-                RichBlock::Embed { title, description, color, fields, image_url, footer } => {
-                    let mut embed = discord_types::DiscordEmbed {
-                        title: title.clone(),
-                        description: Some(if description.len() > 4096 {
-                            format!("{}...", &description[..4090])
-                        } else {
-                            description.clone()
-                        }),
-                        color: *color,
-                        ..Default::default()
-                    };
-                    if !fields.is_empty() {
-                        embed.fields = fields.iter().take(25).map(|(n, v, inline)| {
-                            discord_types::EmbedField {
-                                name: if n.len() > 256 { format!("{}...", &n[..253]) } else { n.clone() },
-                                value: if v.len() > 1024 { format!("{}...", &v[..1021]) } else { v.clone() },
-                                inline: Some(*inline),
-                            }
-                        }).collect();
-                    }
-                    if let Some(img) = image_url {
-                        embed.image = Some(discord_types::EmbedMedia { url: img.clone() });
-                    }
-                    if let Some(ft) = footer {
-                        embed.footer = Some(discord_types::EmbedFooter {
-                            text: ft.clone(),
-                            icon_url: None,
-                        });
-                    }
-                    if let Err(e) = self.api_send_embed(channel_id, None, &embed).await {
-                        warn!("Failed to send embed: {e}");
-                    } else {
-                        any_sent = true;
-                    }
-                }
-                RichBlock::PlainText(t) => {
-                    if !t.trim().is_empty() {
-                        // Chunk plain text to 2000 chars
-                        let mut rem = t.as_str();
-                        while !rem.is_empty() {
-                            let end = if rem.len() <= 2000 {
-                                rem.len()
-                            } else {
-                                let mut e = 2000;
-                                while e > 0 && !rem.is_char_boundary(e) { e -= 1; }
-                                rem[..e].rfind('\n').map(|p| p + 1).unwrap_or(e)
-                            };
-                            let _ = self.api_send_message(channel_id, &rem[..end]).await;
-                            any_sent = true;
-                            rem = &rem[end..];
-                        }
-                    }
-                }
-                RichBlock::Buttons { text, buttons } => {
-                    let components: Vec<crate::types::MessageComponent> = buttons.iter().enumerate().map(|(i, (label, id))| {
-                        crate::types::MessageComponent::Button {
-                            label: label.clone(),
-                            custom_id: id.clone(),
-                            style: if i == 0 { 1 } else { 2 },
-                        }
-                    }).collect();
-                    let _ = self.api_send_with_components(channel_id, text, &components).await;
-                    any_sent = true;
-                }
-                _ => {}
-            }
-        }
-
-        if any_sent {
-            Ok(())
-        } else {
-            // Absolute last resort: chunked plain fallback text
-            let mut rem = fallback_text;
-            while !rem.is_empty() {
-                let end = if rem.len() <= 2000 {
-                    rem.len()
-                } else {
-                    let mut e = 2000;
-                    while e > 0 && !rem.is_char_boundary(e) { e -= 1; }
-                    rem[..e].rfind('\n').map(|p| p + 1).unwrap_or(e)
-                };
-                let _ = self.api_send_message(channel_id, &rem[..end]).await;
-                rem = &rem[end..];
-            }
-            Ok(())
-        }
     }
 
     // ============= PHASE 2: Interactive Components =============
@@ -1424,8 +862,6 @@ impl ChannelAdapter for DiscordAdapter {
         let application_id = self.application_id.clone();
         let voice_connections = self.voice_connections.clone();
         let voice_states = self.voice_states.clone();
-        let voice_managers = self.voice_managers.clone();
-        let gateway_cmd_tx = self.gateway_cmd_tx.clone();
         let mut shutdown = self.shutdown_rx.clone();
 
         tokio::spawn(async move {
@@ -1634,63 +1070,7 @@ impl ChannelAdapter for DiscordAdapter {
                                         });
                                     }
 
-                                    // Parse initial voice states from READY payload
-                                    if let Some(guilds) = d["guilds"].as_array() {
-                                        let mut vs_count = 0u32;
-                                        for guild in guilds {
-                                            let gid = guild["id"].as_str().unwrap_or("").to_string();
-                                            if let Some(states) = guild["voice_states"].as_array() {
-                                                for vs in states {
-                                                    let uid = vs["user_id"].as_str().unwrap_or("").to_string();
-                                                    let cid = vs["channel_id"].as_str().map(String::from);
-                                                    if !uid.is_empty() {
-                                                        voice_states.insert(
-                                                            uid.clone(),
-                                                            voice::VoiceState {
-                                                                user_id: uid,
-                                                                channel_id: cid,
-                                                                guild_id: gid.clone(),
-                                                                self_mute: vs["self_mute"].as_bool().unwrap_or(false),
-                                                                self_deaf: vs["self_deaf"].as_bool().unwrap_or(false),
-                                                            },
-                                                        );
-                                                        vs_count += 1;
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        if vs_count > 0 {
-                                            info!("Discord: loaded {vs_count} initial voice states from READY");
-                                        }
-                                    }
-
                                     info!("Discord bot ready: {username} ({user_id})");
-                                }
-
-                                "GUILD_CREATE" => {
-                                    // Parse voice_states from guild create (lazy guilds)
-                                    let gid = d["id"].as_str().unwrap_or("").to_string();
-                                    if let Some(states) = d["voice_states"].as_array() {
-                                        for vs in states {
-                                            let uid = vs["user_id"].as_str().unwrap_or("").to_string();
-                                            let cid = vs["channel_id"].as_str().map(String::from);
-                                            if !uid.is_empty() {
-                                                voice_states.insert(
-                                                    uid.clone(),
-                                                    voice::VoiceState {
-                                                        user_id: uid,
-                                                        channel_id: cid,
-                                                        guild_id: gid.clone(),
-                                                        self_mute: vs["self_mute"].as_bool().unwrap_or(false),
-                                                        self_deaf: vs["self_deaf"].as_bool().unwrap_or(false),
-                                                    },
-                                                );
-                                            }
-                                        }
-                                        if !states.is_empty() {
-                                            info!("Discord: loaded {} voice states from GUILD_CREATE for guild {gid}", states.len());
-                                        }
-                                    }
                                 }
 
                                 "MESSAGE_CREATE" | "MESSAGE_UPDATE" => {
@@ -1717,116 +1097,7 @@ impl ChannelAdapter for DiscordAdapter {
                                     match interaction_type {
                                         // APPLICATION_COMMAND (slash commands) and MESSAGE_COMPONENT (buttons/selects)
                                         2 | 3 => {
-                                            // Check for voice commands (/join, /leave) - handle directly
-                                            let cmd_name_check = d.get("data")
-                                                .and_then(|dd| dd.get("name"))
-                                                .and_then(|n| n.as_str())
-                                                .unwrap_or("");
-
-                                            if cmd_name_check == "join" || cmd_name_check == "leave" {
-                                                debug!("Discord voice command: /{} from user {} in guild {}", cmd_name_check, 
-                                                    d.get("member").and_then(|m| m.get("user")).and_then(|u| u.get("id")).and_then(|id| id.as_str()).unwrap_or("?"),
-                                                    d.get("guild_id").and_then(|g| g.as_str()).unwrap_or("?")
-                                                );
-                                                let guild_id_str = d.get("guild_id")
-                                                    .and_then(|g| g.as_str())
-                                                    .unwrap_or("")
-                                                    .to_string();
-                                                let user_id_str = d.get("member")
-                                                    .and_then(|m| m.get("user"))
-                                                    .and_then(|u| u.get("id"))
-                                                    .and_then(|id| id.as_str())
-                                                    .unwrap_or("")
-                                                    .to_string();
-
-                                                let ack_url = format!(
-                                                    "{DISCORD_API_BASE}/interactions/{interaction_id}/{interaction_token}/callback"
-                                                );
-
-                                                if cmd_name_check == "join" {
-                                                    let user_vc = voice_states.get(&user_id_str)
-                                                        .and_then(|vs| vs.channel_id.clone());
-
-                                                    if let Some(channel_id) = user_vc {
-                                                        // Create voice connection entry
-                                                        voice_connections.insert(
-                                                            guild_id_str.clone(),
-                                                            voice::VoiceConnection::new(guild_id_str.clone(), channel_id.clone()),
-                                                        );
-
-                                                        // Send gateway opcode 4 to join
-                                                        let join_payload = serde_json::json!({
-                                                            "op": 4,
-                                                            "d": {
-                                                                "guild_id": &guild_id_str,
-                                                                "channel_id": &channel_id,
-                                                                "self_mute": false,
-                                                                "self_deaf": false
-                                                            }
-                                                        });
-                                                        if let Ok(msg) = serde_json::to_string(&join_payload) {
-                                                            let _ = ws_tx.send(
-                                                                tokio_tungstenite::tungstenite::Message::Text(msg)
-                                                            ).await;
-                                                        }
-
-                                                        let ack_body = serde_json::json!({
-                                                            "type": 4,
-                                                            "data": { "content": "Joining your voice channel..." }
-                                                        });
-                                                        let client = reqwest::Client::new();
-                                                        tokio::spawn(async move {
-                                                            let _ = client.post(&ack_url).json(&ack_body).send().await;
-                                                        });
-                                                    } else {
-                                                        debug!("Discord /join: no voice channel found for user {}. Known voice states: {:?}",
-                                                            &user_id_str,
-                                                            voice_states.iter().map(|e| (e.key().clone(), e.value().channel_id.clone())).collect::<Vec<_>>()
-                                                        );
-                                                        let ack_body = serde_json::json!({
-                                                            "type": 4,
-                                                            "data": { "content": "You need to be in a voice channel first! (Try leaving and rejoining your voice channel)" }
-                                                        });
-                                                        let client = reqwest::Client::new();
-                                                        tokio::spawn(async move {
-                                                            let _ = client.post(&ack_url).json(&ack_body).send().await;
-                                                        });
-                                                    }
-                                                } else {
-                                                    // /leave command
-                                                    if let Some(mut mgr) = voice_managers.get_mut(&guild_id_str) {
-                                                        mgr.disconnect();
-                                                    }
-                                                    voice_managers.remove(&guild_id_str);
-                                                    voice_connections.remove(&guild_id_str);
-
-                                                    // Send opcode 4 with null channel
-                                                    let leave_payload = serde_json::json!({
-                                                        "op": 4,
-                                                        "d": {
-                                                            "guild_id": &guild_id_str,
-                                                            "channel_id": serde_json::Value::Null,
-                                                            "self_mute": false,
-                                                            "self_deaf": false
-                                                        }
-                                                    });
-                                                    if let Ok(msg) = serde_json::to_string(&leave_payload) {
-                                                        let _ = ws_tx.send(
-                                                            tokio_tungstenite::tungstenite::Message::Text(msg)
-                                                        ).await;
-                                                    }
-
-                                                    let ack_body = serde_json::json!({
-                                                        "type": 4,
-                                                        "data": { "content": "Left voice channel." }
-                                                    });
-                                                    let client = reqwest::Client::new();
-                                                    tokio::spawn(async move {
-                                                        let _ = client.post(&ack_url).json(&ack_body).send().await;
-                                                    });
-                                                }
-                                                // Don't send to bridge - voice commands handled internally
-                                            } else if let Some(msg) =
+                                            if let Some(msg) =
                                                 parse_interaction(d, &bot_user_id, interaction_type)
                                                     .await
                                             {
@@ -1930,163 +1201,7 @@ impl ChannelAdapter for DiscordAdapter {
                                                 "Discord: voice connection ready for guild {guild_id}, endpoint: {:?}",
                                                 conn.endpoint
                                             );
-
-                                            // Get bot user ID for Songbird ConnectionInfo
-                                            let bot_id_str = bot_user_id.read().await.clone().unwrap_or_default();
-                                            let bot_id_num: u64 = bot_id_str.parse().unwrap_or(0);
-
-                                            if bot_id_num > 0 {
-                                                let conn_snapshot = conn.clone();
-                                                let vm = voice_managers.clone();
-                                                let client_clone = reqwest::Client::new();
-
-                                                tokio::spawn(async move {
-                                                    let mut manager = voice::SongbirdVoiceManager::new();
-                                                    match manager.connect(&conn_snapshot, bot_id_num).await {
-                                                        Ok(()) => {
-                                                            // Set up audio receive pipeline
-                                                            let (audio_tx, mut audio_rx) =
-                                                                tokio::sync::mpsc::unbounded_channel::<voice::AudioCompleteEvent>();
-                                                            let receiver = voice::AudioReceiver::new(audio_tx);
-
-                                                            // Register receive events
-                                                            use songbird::events::{Event as SbEvent, CoreEvent as SbCore};
-                                                            manager.register_event(
-                                                                SbEvent::Core(SbCore::VoiceTick),
-                                                                receiver,
-                                                            );
-
-                                                            let gid = conn_snapshot.guild_id.clone();
-                                                            vm.insert(gid.clone(), manager);
-
-                                                            // Spawn audio processing pipeline
-                                                            let vm2 = vm.clone();
-                                                            tokio::spawn(async move {
-                                                                while let Some(evt) = audio_rx.recv().await {
-                                                                    let ts = std::time::SystemTime::now()
-                                                                        .duration_since(std::time::UNIX_EPOCH)
-                                                                        .unwrap()
-                                                                        .as_millis();
-                                                                    let uid = evt.user_id.unwrap_or(evt.ssrc as u64);
-                                                                    let wav_path = format!("/tmp/openfang_voice_{uid}_{ts}.wav");
-
-                                                                    if let Err(e) = voice::save_pcm_to_wav(&wav_path, &evt.samples) {
-                                                                        error!("Voice: failed to save WAV: {e}");
-                                                                        continue;
-                                                                    }
-                                                                    info!("Voice: saved {:.1}s audio from user {uid} to {wav_path}",
-                                                                        evt.samples.len() as f64 / 48000.0 / 2.0);
-
-                                                                    // 1) Transcribe via OpenFang API
-                                                                    let stt_body = serde_json::json!({
-                                                                        "tool_name": "speech_to_text",
-                                                                        "input": { "path": &wav_path }
-                                                                    });
-                                                                    let stt_resp = client_clone
-                                                                        .post("http://127.0.0.1:4200/api/tools/execute")
-                                                                        .header("Authorization", "Bearer ofk-yog-2026")
-                                                                        .json(&stt_body)
-                                                                        .send()
-                                                                        .await;
-
-                                                                    let transcript = match stt_resp {
-                                                                        Ok(r) => {
-                                                                            let text = r.text().await.unwrap_or_default();
-                                                                            let v: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
-                                                                            v["result"]["transcript"]
-                                                                                .as_str()
-                                                                                .or(v["result"]["description"].as_str())
-                                                                                .unwrap_or("")
-                                                                                .to_string()
-                                                                        }
-                                                                        Err(e) => {
-                                                                            error!("Voice STT failed: {e}");
-                                                                            String::new()
-                                                                        }
-                                                                    };
-
-                                                                    if transcript.trim().is_empty() {
-                                                                        debug!("Voice: empty transcript, skipping");
-                                                                        let _ = std::fs::remove_file(&wav_path);
-                                                                        continue;
-                                                                    }
-                                                                    info!("Voice STT: {transcript}");
-
-                                                                    // 2) Send to default agent
-                                                                    let msg_body = serde_json::json!({
-                                                                        "message": &transcript
-                                                                    });
-                                                                    let agent_resp = client_clone
-                                                                        .post("http://127.0.0.1:4200/api/agents/assistant/message")
-                                                                        .header("Authorization", "Bearer ofk-yog-2026")
-                                                                        .json(&msg_body)
-                                                                        .send()
-                                                                        .await;
-
-                                                                    let reply = match agent_resp {
-                                                                        Ok(r) => {
-                                                                            let text = r.text().await.unwrap_or_default();
-                                                                            let v: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
-                                                                            v["response"]
-                                                                                .as_str()
-                                                                                .or(v["content"].as_str())
-                                                                                .unwrap_or("")
-                                                                                .to_string()
-                                                                        }
-                                                                        Err(e) => {
-                                                                            error!("Voice agent call failed: {e}");
-                                                                            String::new()
-                                                                        }
-                                                                    };
-
-                                                                    if reply.trim().is_empty() {
-                                                                        warn!("Voice: empty agent reply");
-                                                                        let _ = std::fs::remove_file(&wav_path);
-                                                                        continue;
-                                                                    }
-                                                                    info!("Voice agent reply: {reply}");
-
-                                                                    // 3) TTS
-                                                                    let tts_body = serde_json::json!({
-                                                                        "tool_name": "text_to_speech",
-                                                                        "input": { "text": &reply }
-                                                                    });
-                                                                    let tts_resp = client_clone
-                                                                        .post("http://127.0.0.1:4200/api/tools/execute")
-                                                                        .header("Authorization", "Bearer ofk-yog-2026")
-                                                                        .json(&tts_body)
-                                                                        .send()
-                                                                        .await;
-
-                                                                    match tts_resp {
-                                                                        Ok(r) => {
-                                                                            let text = r.text().await.unwrap_or_default();
-                                                                            let v: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
-                                                                            if let Some(audio_path) = v["result"]["saved_to"].as_str() {
-                                                                                if let Some(mut mgr) = vm2.get_mut(&gid) {
-                                                                                    mgr.play_file(audio_path);
-                                                                                }
-                                                                            } else {
-                                                                                error!("Voice TTS: no audio path in response");
-                                                                            }
-                                                                        }
-                                                                        Err(e) => {
-                                                                            error!("Voice TTS failed: {e}");
-                                                                        }
-                                                                    }
-
-                                                                    // Cleanup temp WAV
-                                                                    let _ = std::fs::remove_file(&wav_path);
-                                                                }
-                                                                info!("Voice: audio pipeline exited for guild {gid}");
-                                                            });
-                                                        }
-                                                        Err(e) => {
-                                                            error!("Discord: Songbird voice connect failed: {e}");
-                                                        }
-                                                    }
-                                                });
-                                            }
+                                            // TODO: connect to voice WebSocket and start audio pipeline
                                         }
                                     }
                                 }
@@ -2233,10 +1348,6 @@ impl ChannelAdapter for DiscordAdapter {
                 self.api_send_with_components(channel_id, &message, &components)
                     .await?;
             }
-            ChannelContent::Rich { blocks, fallback_text } => {
-                self.send_rich_blocks(channel_id, &blocks, &fallback_text)
-                    .await?;
-            }
             ChannelContent::Command { .. } => {
                 // Commands are handled upstream by the bridge
             }
@@ -2324,14 +1435,6 @@ async fn register_slash_commands(
         {
             "name": "reset",
             "description": "Reset conversation context"
-        },
-        {
-            "name": "join",
-            "description": "Join your current voice channel"
-        },
-        {
-            "name": "leave",
-            "description": "Leave the voice channel"
         }
     ]);
 
@@ -2343,7 +1446,7 @@ async fn register_slash_commands(
         .await?;
 
     if resp.status().is_success() {
-        info!("Discord: registered slash commands");
+        info!("Discord: registered 7 slash commands");
     } else {
         let body = resp.text().await.unwrap_or_default();
         warn!("Discord: failed to register slash commands: {body}");
@@ -2523,48 +1626,9 @@ async fn parse_discord_message(
     }
 
     let content_text = d["content"].as_str().unwrap_or("");
-
-    // Parse attachments (files, images sent via Discord)
-    let mut attachment_lines: Vec<String> = Vec::new();
-    if let Some(attachments) = d.get("attachments").and_then(|a| a.as_array()) {
-        for att in attachments {
-            let filename = att["filename"].as_str().unwrap_or("file");
-            let url = att["url"].as_str().unwrap_or("");
-            let content_type = att["content_type"].as_str().unwrap_or("");
-            let size = att["size"].as_u64().unwrap_or(0);
-            if !url.is_empty() {
-                if content_type.starts_with("image/") {
-                    attachment_lines.push(format!("[Attached image: {filename}]({url})"));
-                } else {
-                    let size_str = if size > 1_000_000 {
-                        format!("{:.1}MB", size as f64 / 1_000_000.0)
-                    } else if size > 1000 {
-                        format!("{:.0}KB", size as f64 / 1000.0)
-                    } else {
-                        format!("{size}B")
-                    };
-                    attachment_lines.push(
-                        format!("[Attached file: {filename} ({size_str})]({url})")
-                    );
-                }
-            }
-        }
-    }
-
-    // Skip if both text content and attachments are empty
-    if content_text.is_empty() && attachment_lines.is_empty() {
+    if content_text.is_empty() {
         return None;
     }
-
-    // Combine text with attachment info
-    let combined_text = if attachment_lines.is_empty() {
-        content_text.to_string()
-    } else if content_text.is_empty() {
-        attachment_lines.join("\n")
-    } else {
-        format!("{}\n\n{}", content_text, attachment_lines.join("\n"))
-    };
-    let content_text = &combined_text;
 
     let channel_id = d["channel_id"].as_str()?;
     let message_id = d["id"].as_str().unwrap_or("0");
@@ -2639,7 +1703,7 @@ mod tests {
             "timestamp": "2024-01-01T00:00:00+00:00"
         });
 
-        let msg = parse_discord_message(&d, &bot_id, &[], &[])
+        let msg = parse_discord_message(&d, &bot_id, &[])
             .await
             .unwrap();
         assert_eq!(msg.channel, ChannelType::Discord);
@@ -2663,7 +1727,7 @@ mod tests {
             "timestamp": "2024-01-01T00:00:00+00:00"
         });
 
-        let msg = parse_discord_message(&d, &bot_id, &[], &[]).await;
+        let msg = parse_discord_message(&d, &bot_id, &[]).await;
         assert!(msg.is_none());
     }
 
@@ -2683,7 +1747,7 @@ mod tests {
             "timestamp": "2024-01-01T00:00:00+00:00"
         });
 
-        let msg = parse_discord_message(&d, &bot_id, &[], &[]).await;
+        let msg = parse_discord_message(&d, &bot_id, &[]).await;
         assert!(msg.is_none());
     }
 
@@ -2727,7 +1791,7 @@ mod tests {
             "timestamp": "2024-01-01T00:00:00+00:00"
         });
 
-        let msg = parse_discord_message(&d, &bot_id, &[], &[])
+        let msg = parse_discord_message(&d, &bot_id, &[])
             .await
             .unwrap();
         match &msg.content {
@@ -2754,7 +1818,7 @@ mod tests {
             "timestamp": "2024-01-01T00:00:00+00:00"
         });
 
-        let msg = parse_discord_message(&d, &bot_id, &[], &[]).await;
+        let msg = parse_discord_message(&d, &bot_id, &[]).await;
         assert!(msg.is_none());
     }
 
@@ -2773,7 +1837,7 @@ mod tests {
             "timestamp": "2024-01-01T00:00:00+00:00"
         });
 
-        let msg = parse_discord_message(&d, &bot_id, &[], &[])
+        let msg = parse_discord_message(&d, &bot_id, &[])
             .await
             .unwrap();
         assert_eq!(msg.sender.display_name, "alice#1234");
@@ -2797,7 +1861,7 @@ mod tests {
         });
 
         // MESSAGE_UPDATE uses the same parse function as MESSAGE_CREATE
-        let msg = parse_discord_message(&d, &bot_id, &[], &[])
+        let msg = parse_discord_message(&d, &bot_id, &[])
             .await
             .unwrap();
         assert_eq!(msg.channel, ChannelType::Discord);
@@ -2807,95 +1871,6 @@ mod tests {
     }
 
     #[tokio::test]
-
-    #[tokio::test]
-    async fn test_parse_discord_allowed_users_filter() {
-        let bot_id = Arc::new(RwLock::new(Some("bot123".to_string())));
-        let d = serde_json::json!({
-            "id": "msg1",
-            "channel_id": "ch1",
-            "content": "Hello",
-            "author": {
-                "id": "user999",
-                "username": "bob",
-                "discriminator": "0"
-            },
-            "timestamp": "2024-01-01T00:00:00+00:00"
-        });
-
-        // Not in allowed users
-        let msg = parse_discord_message(&d, &bot_id, &[], &["user111".into(), "user222".into()]).await;
-        assert!(msg.is_none());
-
-        // In allowed users
-        let msg = parse_discord_message(&d, &bot_id, &[], &["user999".into()]).await;
-        assert!(msg.is_some());
-
-        // Empty allowed_users = allow all
-        let msg = parse_discord_message(&d, &bot_id, &[], &[]).await;
-        assert!(msg.is_some());
-    }
-
-    #[tokio::test]
-    async fn test_parse_discord_mention_detection() {
-        let bot_id = Arc::new(RwLock::new(Some("bot123".to_string())));
-
-        // Message with bot mentioned in mentions array
-        let d = serde_json::json!({
-            "id": "msg1",
-            "channel_id": "ch1",
-            "guild_id": "guild1",
-            "content": "Hey <@bot123> help me",
-            "mentions": [{"id": "bot123", "username": "openfang"}],
-            "author": {
-                "id": "user1",
-                "username": "alice",
-                "discriminator": "0"
-            },
-            "timestamp": "2024-01-01T00:00:00+00:00"
-        });
-
-        let msg = parse_discord_message(&d, &bot_id, &[], &[]).await.unwrap();
-        assert!(msg.is_group);
-        assert_eq!(msg.metadata.get("was_mentioned").and_then(|v| v.as_bool()), Some(true));
-
-        // Message without mention in group
-        let d2 = serde_json::json!({
-            "id": "msg2",
-            "channel_id": "ch1",
-            "guild_id": "guild1",
-            "content": "Just chatting",
-            "author": {
-                "id": "user1",
-                "username": "alice",
-                "discriminator": "0"
-            },
-            "timestamp": "2024-01-01T00:00:00+00:00"
-        });
-
-        let msg2 = parse_discord_message(&d2, &bot_id, &[], &[]).await.unwrap();
-        assert!(msg2.is_group);
-        assert!(!msg2.metadata.contains_key("was_mentioned"));
-    }
-
-    #[tokio::test]
-    async fn test_parse_discord_dm_not_group() {
-        let bot_id = Arc::new(RwLock::new(None));
-        let d = serde_json::json!({
-            "id": "msg1",
-            "channel_id": "dm-ch1",
-            "content": "Hello",
-            "author": {
-                "id": "user1",
-                "username": "alice",
-                "discriminator": "0"
-            },
-            "timestamp": "2024-01-01T00:00:00+00:00"
-        });
-
-        let msg = parse_discord_message(&d, &bot_id, &[], &[]).await.unwrap();
-        assert!(!msg.is_group);
-    }
     async fn test_parse_interaction_slash_command() {
         let bot_id = Arc::new(RwLock::new(Some("bot123".to_string())));
         let d = serde_json::json!({
@@ -3001,13 +1976,9 @@ mod tests {
     #[test]
     fn test_discord_adapter_creation() {
         let adapter = DiscordAdapter::new(
-            
             "test-token".to_string(),
-            
             vec!["123".to_string(), "456".to_string()],
-            vec![],
             37376,
-        
         );
         assert_eq!(adapter.name(), "discord");
         assert_eq!(adapter.channel_type(), ChannelType::Discord);
