@@ -134,9 +134,14 @@ impl WebFetchEngine {
 
         // Step 5: Truncate
         let truncated = if processed.len() > self.config.max_chars {
+            // Find a valid UTF-8 char boundary at or before max_chars
+            let mut end = self.config.max_chars;
+            while end > 0 && !processed.is_char_boundary(end) {
+                end -= 1;
+            }
             format!(
                 "{}... [truncated, {} total chars]",
-                &processed[..self.config.max_chars],
+                &processed[..end],
                 processed.len()
             )
         } else {

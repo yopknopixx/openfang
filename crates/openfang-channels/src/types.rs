@@ -37,6 +37,36 @@ pub struct ChannelUser {
     pub openfang_user: Option<String>,
 }
 
+/// Rich content block for Discord embeds, buttons, galleries, etc.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum RichBlock {
+    /// Discord embed with optional fields, images, footer.
+    Embed {
+        title: Option<String>,
+        description: String,
+        color: Option<u32>,
+        fields: Vec<(String, String, bool)>,
+        image_url: Option<String>,
+        footer: Option<String>,
+    },
+    /// Row of clickable buttons.
+    Buttons {
+        text: String,
+        buttons: Vec<(String, String)>,
+    },
+    /// Gallery of images with optional captions.
+    ImageGallery {
+        images: Vec<(String, Option<String>)>,
+    },
+    /// Section with text and optional thumbnail.
+    Section {
+        text: String,
+        thumbnail_url: Option<String>,
+    },
+    /// Plain text block (content outside rich markers).
+    PlainText(String),
+}
+
 /// Content types that can be received from a channel.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ChannelContent {
@@ -61,6 +91,42 @@ pub enum ChannelContent {
         name: String,
         args: Vec<String>,
     },
+    /// Interactive message with buttons, select menus, etc.
+    Interactive {
+        message: String,
+        components: Vec<MessageComponent>,
+    },
+    /// Rich content with structured blocks (embeds, buttons, galleries).
+    Rich {
+        blocks: Vec<RichBlock>,
+        fallback_text: String,
+    },
+}
+
+/// Interactive UI component for channel messages.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum MessageComponent {
+    Button {
+        label: String,
+        custom_id: String,
+        /// Button style: 1=primary, 2=secondary, 3=success, 4=danger
+        style: u8,
+    },
+    SelectMenu {
+        custom_id: String,
+        placeholder: Option<String>,
+        options: Vec<SelectOption>,
+        min_values: u32,
+        max_values: u32,
+    },
+}
+
+/// Option for a select menu component.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SelectOption {
+    pub label: String,
+    pub value: String,
+    pub description: Option<String>,
 }
 
 /// A unified message from any channel.

@@ -11,10 +11,144 @@ use openfang_types::config::OutputFormat;
 pub fn format_for_channel(text: &str, format: OutputFormat) -> String {
     match format {
         OutputFormat::Markdown => text.to_string(),
+        OutputFormat::DiscordMarkdown => markdown_to_discord(text),
         OutputFormat::TelegramHtml => markdown_to_telegram_html(text),
         OutputFormat::SlackMrkdwn => markdown_to_slack_mrkdwn(text),
         OutputFormat::PlainText => markdown_to_plain(text),
     }
+}
+
+
+/// Convert standard Markdown to Discord-flavored Markdown.
+///
+/// Discord supports: **bold**, *italic*, __underline__, ~~strikethrough~~,
+/// `inline code`, ```code blocks```, > blockquotes, # ## ### headers,
+/// - unordered lists, ordered lists, [text](url) links, ||spoilers||.
+///
+/// Discord does NOT support: Markdown tables, raw HTML tags.
+/// This function converts tables into monospace code blocks.
+fn markdown_to_discord(text: &str) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut result: Vec<String> = Vec::new();
+    let mut i = 0;
+    let mut in_code_block = false;
+
+    while i < lines.len() {
+        let line = lines[i];
+
+        // Track code blocks (don't modify content inside them)
+        if line.trim_start().starts_with("```") {
+            in_code_block = !in_code_block;
+            result.push(line.to_string());
+            i += 1;
+            continue;
+        }
+
+        if in_code_block {
+            result.push(line.to_string());
+            i += 1;
+            continue;
+        }
+
+        // Detect markdown table: line with pipes, next line is separator (|---|---|)
+        if line.contains('|') && i + 1 < lines.len() {
+            let next = lines[i + 1];
+            let stripped = next
+                .replace('|', "")
+                .replace('-', "")
+                .replace(':', "")
+                .replace(' ', "");
+            let is_table_sep =
+                next.contains('|') && next.contains('-') && stripped.is_empty();
+
+            if is_table_sep {
+                let header_cells: Vec<&str> = line
+                    .split('|')
+                    .map(|c| c.trim())
+                    .filter(|c| !c.is_empty())
+                    .collect();
+
+                i += 2; // skip header + separator
+
+                let mut rows: Vec<Vec<String>> = Vec::new();
+                while i < lines.len() && lines[i].contains('|') {
+                    let cells: Vec<String> = lines[i]
+                        .split('|')
+                        .map(|c| c.trim().to_string())
+                        .filter(|c| !c.is_empty())
+                        .collect();
+                    if cells.is_empty() {
+                        break;
+                    }
+                    rows.push(cells);
+                    i += 1;
+                }
+
+                let num_cols = header_cells.len();
+                let mut widths = vec![0usize; num_cols];
+                for (j, h) in header_cells.iter().enumerate() {
+                    widths[j] = widths[j].max(h.len());
+                }
+                for row in &rows {
+                    for (j, cell) in row.iter().enumerate() {
+                        if j < num_cols {
+                            widths[j] = widths[j].max(cell.len());
+                        }
+                    }
+                }
+
+                // Render as monospace code block
+                result.push("```".to_string());
+
+                let header_line: String = header_cells
+                    .iter()
+                    .enumerate()
+                    .map(|(j, h)| {
+                        let w = widths.get(j).copied().unwrap_or(0);
+                        format!("{:<w$}", h, w = w)
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" | ");
+                result.push(header_line);
+
+                let sep_line: String = widths
+                    .iter()
+                    .map(|w| "-".repeat(*w))
+                    .collect::<Vec<_>>()
+                    .join("-+-");
+                result.push(sep_line);
+
+                for row in &rows {
+                    let data_line: String = (0..num_cols)
+                        .map(|j| {
+                            let cell = row.get(j).map(|s| s.as_str()).unwrap_or("");
+                            let w = widths.get(j).copied().unwrap_or(0);
+                            format!("{:<w$}", cell, w = w)
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" | ");
+                    result.push(data_line);
+                }
+
+                result.push("```".to_string());
+                continue;
+            }
+        }
+
+        // Strip HTML tags Discord doesn't render
+        let mut cleaned = line.to_string();
+        for tag in &[
+            "<br>", "<br/>", "<br />", "<hr>", "<hr/>", "<hr />",
+            "<p>", "</p>", "<div>", "</div>", "<span>", "</span>",
+        ] {
+            cleaned = cleaned.replace(tag, "");
+        }
+
+        result.push(cleaned);
+        i += 1;
+    }
+
+    result.join("\n")
 }
 
 /// Convert Markdown to Telegram HTML subset.

@@ -194,6 +194,11 @@ fn provider_defaults(provider: &str) -> Option<ProviderDefaults> {
             api_key_env: "VOLCENGINE_API_KEY",
             key_required: true,
         }),
+        "digitalocean" | "do" => Some(ProviderDefaults {
+            base_url: DO_BASE_URL,
+            api_key_env: "DO_API_KEY",
+            key_required: true,
+        }),
         _ => None,
     }
 }
@@ -384,6 +389,7 @@ pub fn known_providers() -> &'static [&'static str] {
         "volcengine",
         "codex",
         "claude-code",
+    "digitalocean",
     ]
 }
 
@@ -521,3 +527,4 @@ mod tests {
         assert!(d.key_required);
     }
 }
+pub const DO_BASE_URL: &str = "https://inference.do-ai.run/v1";

@@ -385,7 +385,7 @@ fn build_channel_section(channel: &str) -> String {
         ),
         "discord" => (
             "2000",
-            "Use Discord markdown. Split long responses across multiple messages if needed.",
+            "Use Discord markdown (bold, italic, code blocks, blockquotes, headers, links, lists).\n             Discord does NOT render markdown tables — use code blocks for tabular data.\n\n             You can use rich formatting blocks in your response:\n             - :::embed title=\"Title\" color=blue\n  Description text here\n  | Field | Value |\n  :::  — creates a highlighted embed box\n             - :::buttons\n  [Label](btn:id)\n  :::  — creates clickable button row\n             - :::gallery\n  ![alt](url)\n  :::  — creates image gallery\n\n             Use embeds for: summaries, status reports, structured results, key findings.\n             Use buttons when presenting choices or confirmations.\n             Keep plain markdown for conversational responses. Only use rich blocks when content benefits from visual structure.\n             Split long responses if over 2000 chars.",
         ),
         "slack" => (
             "4000",

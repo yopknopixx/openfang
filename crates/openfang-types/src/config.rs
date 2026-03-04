@@ -45,6 +45,8 @@ pub enum OutputFormat {
     SlackMrkdwn,
     /// Plain text (no formatting).
     PlainText,
+    /// Discord-flavored Markdown (converts tables, HTML, etc.).
+    DiscordMarkdown,
 }
 
 /// Per-channel behavior overrides.

@@ -429,6 +429,9 @@ impl ChannelAdapter for TelegramAdapter {
                 let text = format!("/{name} {}", args.join(" "));
                 self.api_send_message(chat_id, text.trim()).await?;
             }
+            _ => {
+                self.api_send_message(chat_id, "(Unsupported content type)").await?;
+            }
         }
         Ok(())
     }
@@ -651,6 +654,9 @@ mod tests {
                 assert_eq!(name, "agent");
                 assert_eq!(args, &["hello-world"]);
             }
+            _ => {
+                self.api_send_message(chat_id, "(Unsupported content type)").await?;
+            }
             other => panic!("Expected Command, got {other:?}"),
         }
     }
@@ -748,6 +754,9 @@ mod tests {
             ChannelContent::Command { name, args } => {
                 assert_eq!(name, "agents");
                 assert!(args.is_empty());
+            }
+            _ => {
+                self.api_send_message(chat_id, "(Unsupported content type)").await?;
             }
             other => panic!("Expected Command, got {other:?}"),
         }
