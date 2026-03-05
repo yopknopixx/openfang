@@ -920,6 +920,28 @@ impl Default for ThinkingConfig {
     }
 }
 
+/// Per-hand model override configuration.
+/// Allows overriding the LLM provider/model for specific hands in config.toml.
+///
+/// Example:
+/// 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HandModelOverride {
+    /// Provider override (e.g., "digitalocean", "anthropic", "ollama").
+    #[serde(default)]
+    pub provider: Option<String>,
+    /// Model override (e.g., "digitalocean/openai-gpt-oss-120b").
+    #[serde(default)]
+    pub model: Option<String>,
+    /// API key environment variable override.
+    #[serde(default)]
+    pub api_key_env: Option<String>,
+    /// Base URL override for the provider.
+    #[serde(default)]
+    pub base_url: Option<String>,
+}
+
 /// Top-level kernel configuration.
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -1040,6 +1062,10 @@ pub struct KernelConfig {
     /// Global spending budget configuration.
     #[serde(default)]
     pub budget: BudgetConfig,
+    /// Per-hand model overrides (hand_id -> model config).
+    /// Allows overriding the LLM provider/model for specific hands.
+    #[serde(default)]
+    pub hands: HashMap<String, HandModelOverride>,
     /// Provider base URL overrides (provider ID → custom base URL).
     /// e.g. `ollama = "http://192.168.1.100:11434/v1"`
     #[serde(default)]
@@ -1212,6 +1238,7 @@ impl Default for KernelConfig {
             auth_profiles: HashMap::new(),
             thinking: None,
             budget: BudgetConfig::default(),
+            hands: HashMap::new(),
             provider_urls: HashMap::new(),
             oauth: OAuthConfig::default(),
         }

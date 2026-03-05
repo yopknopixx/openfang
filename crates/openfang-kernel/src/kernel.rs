@@ -2873,16 +2873,38 @@ impl OpenFangKernel {
 
         // Build an agent manifest from the hand definition.
         // If the hand declares provider/model as "default", inherit the kernel's configured LLM.
-        let hand_provider = if def.agent.provider == "default" {
+        // Check for per-hand model overrides in config.toml [hands.<hand_id>]
+        let hand_override = self.config.hands.get(hand_id);
+
+        let hand_provider = if let Some(ovr) = hand_override.and_then(|h| h.provider.as_deref()) {
+            ovr.to_string()
+        } else if def.agent.provider == "default" {
             self.config.default_model.provider.clone()
         } else {
             def.agent.provider.clone()
         };
-        let hand_model = if def.agent.model == "default" {
+        let hand_model = if let Some(ovr) = hand_override.and_then(|h| h.model.as_deref()) {
+            ovr.to_string()
+        } else if def.agent.model == "default" {
             self.config.default_model.model.clone()
         } else {
             def.agent.model.clone()
         };
+        let hand_api_key_env = hand_override
+            .and_then(|h| h.api_key_env.clone())
+            .or_else(|| def.agent.api_key_env.clone());
+        let hand_base_url = hand_override
+            .and_then(|h| h.base_url.clone())
+            .or_else(|| def.agent.base_url.clone());
+
+        if hand_override.is_some() {
+            info!(
+                hand = %hand_id,
+                provider = %hand_provider,
+                model = %hand_model,
+                "Hand model override applied from config"
+            );
+        }
 
         let mut manifest = AgentManifest {
             name: def.agent.name.clone(),
@@ -2894,8 +2916,8 @@ impl OpenFangKernel {
                 max_tokens: def.agent.max_tokens,
                 temperature: def.agent.temperature,
                 system_prompt: def.agent.system_prompt.clone(),
-                api_key_env: def.agent.api_key_env.clone(),
-                base_url: def.agent.base_url.clone(),
+                api_key_env: hand_api_key_env,
+                base_url: hand_base_url,
             },
             capabilities: ManifestCapabilities {
                 tools: def.tools.clone(),
