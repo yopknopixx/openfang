@@ -2639,7 +2639,7 @@ mod tests {
             "timestamp": "2024-01-01T00:00:00+00:00"
         });
 
-        let msg = parse_discord_message(&d, &bot_id, &[], &[])
+        let msg = parse_discord_message(&d, &bot_id, &[])
             .await
             .unwrap();
         assert_eq!(msg.channel, ChannelType::Discord);
@@ -2663,7 +2663,7 @@ mod tests {
             "timestamp": "2024-01-01T00:00:00+00:00"
         });
 
-        let msg = parse_discord_message(&d, &bot_id, &[], &[]).await;
+        let msg = parse_discord_message(&d, &bot_id, &[]).await;
         assert!(msg.is_none());
     }
 
@@ -2683,7 +2683,7 @@ mod tests {
             "timestamp": "2024-01-01T00:00:00+00:00"
         });
 
-        let msg = parse_discord_message(&d, &bot_id, &[], &[]).await;
+        let msg = parse_discord_message(&d, &bot_id, &[]).await;
         assert!(msg.is_none());
     }
 
@@ -2727,7 +2727,7 @@ mod tests {
             "timestamp": "2024-01-01T00:00:00+00:00"
         });
 
-        let msg = parse_discord_message(&d, &bot_id, &[], &[])
+        let msg = parse_discord_message(&d, &bot_id, &[])
             .await
             .unwrap();
         match &msg.content {
@@ -2754,7 +2754,7 @@ mod tests {
             "timestamp": "2024-01-01T00:00:00+00:00"
         });
 
-        let msg = parse_discord_message(&d, &bot_id, &[], &[]).await;
+        let msg = parse_discord_message(&d, &bot_id, &[]).await;
         assert!(msg.is_none());
     }
 
@@ -2773,7 +2773,7 @@ mod tests {
             "timestamp": "2024-01-01T00:00:00+00:00"
         });
 
-        let msg = parse_discord_message(&d, &bot_id, &[], &[])
+        let msg = parse_discord_message(&d, &bot_id, &[])
             .await
             .unwrap();
         assert_eq!(msg.sender.display_name, "alice#1234");
@@ -2797,7 +2797,7 @@ mod tests {
         });
 
         // MESSAGE_UPDATE uses the same parse function as MESSAGE_CREATE
-        let msg = parse_discord_message(&d, &bot_id, &[], &[])
+        let msg = parse_discord_message(&d, &bot_id, &[])
             .await
             .unwrap();
         assert_eq!(msg.channel, ChannelType::Discord);
@@ -2806,96 +2806,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
 
     #[tokio::test]
-    async fn test_parse_discord_allowed_users_filter() {
-        let bot_id = Arc::new(RwLock::new(Some("bot123".to_string())));
-        let d = serde_json::json!({
-            "id": "msg1",
-            "channel_id": "ch1",
-            "content": "Hello",
-            "author": {
-                "id": "user999",
-                "username": "bob",
-                "discriminator": "0"
-            },
-            "timestamp": "2024-01-01T00:00:00+00:00"
-        });
-
-        // Not in allowed users
-        let msg = parse_discord_message(&d, &bot_id, &[], &["user111".into(), "user222".into()]).await;
-        assert!(msg.is_none());
-
-        // In allowed users
-        let msg = parse_discord_message(&d, &bot_id, &[], &["user999".into()]).await;
-        assert!(msg.is_some());
-
-        // Empty allowed_users = allow all
-        let msg = parse_discord_message(&d, &bot_id, &[], &[]).await;
-        assert!(msg.is_some());
-    }
-
-    #[tokio::test]
-    async fn test_parse_discord_mention_detection() {
-        let bot_id = Arc::new(RwLock::new(Some("bot123".to_string())));
-
-        // Message with bot mentioned in mentions array
-        let d = serde_json::json!({
-            "id": "msg1",
-            "channel_id": "ch1",
-            "guild_id": "guild1",
-            "content": "Hey <@bot123> help me",
-            "mentions": [{"id": "bot123", "username": "openfang"}],
-            "author": {
-                "id": "user1",
-                "username": "alice",
-                "discriminator": "0"
-            },
-            "timestamp": "2024-01-01T00:00:00+00:00"
-        });
-
-        let msg = parse_discord_message(&d, &bot_id, &[], &[]).await.unwrap();
-        assert!(msg.is_group);
-        assert_eq!(msg.metadata.get("was_mentioned").and_then(|v| v.as_bool()), Some(true));
-
-        // Message without mention in group
-        let d2 = serde_json::json!({
-            "id": "msg2",
-            "channel_id": "ch1",
-            "guild_id": "guild1",
-            "content": "Just chatting",
-            "author": {
-                "id": "user1",
-                "username": "alice",
-                "discriminator": "0"
-            },
-            "timestamp": "2024-01-01T00:00:00+00:00"
-        });
-
-        let msg2 = parse_discord_message(&d2, &bot_id, &[], &[]).await.unwrap();
-        assert!(msg2.is_group);
-        assert!(!msg2.metadata.contains_key("was_mentioned"));
-    }
-
-    #[tokio::test]
-    async fn test_parse_discord_dm_not_group() {
-        let bot_id = Arc::new(RwLock::new(None));
-        let d = serde_json::json!({
-            "id": "msg1",
-            "channel_id": "dm-ch1",
-            "content": "Hello",
-            "author": {
-                "id": "user1",
-                "username": "alice",
-                "discriminator": "0"
-            },
-            "timestamp": "2024-01-01T00:00:00+00:00"
-        });
-
-        let msg = parse_discord_message(&d, &bot_id, &[], &[]).await.unwrap();
-        assert!(!msg.is_group);
-    }
     async fn test_parse_interaction_slash_command() {
         let bot_id = Arc::new(RwLock::new(Some("bot123".to_string())));
         let d = serde_json::json!({
@@ -3001,13 +2913,9 @@ mod tests {
     #[test]
     fn test_discord_adapter_creation() {
         let adapter = DiscordAdapter::new(
-            
             "test-token".to_string(),
-            
             vec!["123".to_string(), "456".to_string()],
-            vec![],
             37376,
-        
         );
         assert_eq!(adapter.name(), "discord");
         assert_eq!(adapter.channel_type(), ChannelType::Discord);

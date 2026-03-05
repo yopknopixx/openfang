@@ -486,7 +486,7 @@ mod tests {
         assert!(providers.contains(&"volcengine"));
         assert!(providers.contains(&"codex"));
         assert!(providers.contains(&"claude-code"));
-        assert_eq!(providers.len(), 30);
+        assert_eq!(providers.len(), 31);
     }
 
     #[test]
