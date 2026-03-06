@@ -54,7 +54,7 @@ impl MediaEngine {
     }
 
     /// Transcribe audio using speech-to-text.
-    /// Auto-cascade: Groq (whisper-large-v3-turbo) -> OpenAI (whisper-1).
+    /// Auto-cascade: Local (whisper.cpp) -> Groq (whisper-large-v3-turbo) -> OpenAI (whisper-1).
     pub async fn transcribe_audio(
         &self,
         attachment: &MediaAttachment,
@@ -115,6 +115,9 @@ impl MediaEngine {
                 "https://api.groq.com/openai/v1/audio/transcriptions",
                 std::env::var("GROQ_API_KEY").map_err(|_| "GROQ_API_KEY not set")?,
             ),
+            "local" => {
+                return self.transcribe_local(attachment).await;
+            }
             "openai" => (
                 "https://api.openai.com/v1/audio/transcriptions",
                 std::env::var("OPENAI_API_KEY").map_err(|_| "OPENAI_API_KEY not set")?,
@@ -172,6 +175,102 @@ impl MediaEngine {
             description: transcription,
             provider: provider.to_string(),
             model: model.to_string(),
+        })
+    }
+
+
+    /// Transcribe audio locally using whisper.cpp (no API key needed).
+    async fn transcribe_local(
+        &self,
+        attachment: &MediaAttachment,
+    ) -> Result<MediaUnderstanding, String> {
+        let whisper_bin = which_whisper_cli()
+            .ok_or("whisper-cli not found on PATH")?;
+        let model_path = default_whisper_model();
+
+        // Write audio to a temp file (whisper-cli needs a file path)
+        let tmp_dir = std::env::temp_dir();
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+
+        let ext = match attachment.mime_type.as_str() {
+            "audio/wav" => "wav",
+            "audio/mpeg" | "audio/mp3" => "mp3",
+            "audio/ogg" => "ogg",
+            "audio/webm" => "webm",
+            "audio/flac" => "flac",
+            _ => "wav",
+        };
+        let tmp_path = tmp_dir.join(format!("openfang_stt_{ts}.{ext}"));
+
+        // Read audio bytes
+        let audio_bytes = match &attachment.source {
+            MediaSource::FilePath { path } => tokio::fs::read(path)
+                .await
+                .map_err(|e| format!("Failed to read audio file: {e}"))?,
+            MediaSource::Base64 { data, .. } => {
+                use base64::Engine;
+                base64::engine::general_purpose::STANDARD
+                    .decode(data)
+                    .map_err(|e| format!("Failed to decode base64 audio: {e}"))?
+            }
+            MediaSource::Url { url } => {
+                return Err(format!("URL audio source not supported for local transcription: {url}"));
+            }
+        };
+
+        tokio::fs::write(&tmp_path, &audio_bytes)
+            .await
+            .map_err(|e| format!("Failed to write temp audio file: {e}"))?;
+
+        info!(
+            model = %model_path,
+            size = audio_bytes.len(),
+            path = %tmp_path.display(),
+            "Local whisper.cpp transcription starting"
+        );
+
+        // Run whisper-cli with --no-timestamps and --no-prints for clean text output
+        let output = tokio::process::Command::new(&whisper_bin)
+            .arg("-m")
+            .arg(&model_path)
+            .arg("-f")
+            .arg(&tmp_path)
+            .arg("--no-timestamps")
+            .arg("-np")
+            .arg("-t")
+            .arg(std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(8).to_string())
+            .output()
+            .await
+            .map_err(|e| format!("Failed to run whisper-cli: {e}"))?;
+
+        // Clean up temp file
+        let _ = tokio::fs::remove_file(&tmp_path).await;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!("whisper-cli failed (exit {}): {}", output.status, stderr));
+        }
+
+        let transcript = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if transcript.is_empty() {
+            return Err("Local whisper returned empty transcript".into());
+        }
+
+        info!(
+            provider = "local",
+            model = "ggml-base.en",
+            chars = transcript.len(),
+            "Local audio transcription complete"
+        );
+
+        Ok(MediaUnderstanding {
+            media_type: MediaType::Audio,
+            description: transcript,
+            provider: "local".to_string(),
+            model: "whisper.cpp/base.en".to_string(),
         })
     }
 
@@ -251,8 +350,58 @@ fn detect_vision_provider() -> Option<&'static str> {
     None
 }
 
+/// Check if whisper-cli is available on PATH.
+fn which_whisper_cli() -> Option<std::path::PathBuf> {
+    let candidates = [
+        "/usr/local/bin/whisper-cli",
+        "/usr/bin/whisper-cli",
+    ];
+    for p in candidates {
+        let path = std::path::Path::new(p);
+        if path.exists() {
+            return Some(path.to_path_buf());
+        }
+    }
+    // Fall back to PATH search
+    std::process::Command::new("which")
+        .arg("whisper-cli")
+        .output()
+        .ok()
+        .and_then(|o| {
+            if o.status.success() {
+                let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                if !s.is_empty() {
+                    Some(std::path::PathBuf::from(s))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        })
+}
+
+/// Default whisper model path.
+fn default_whisper_model() -> String {
+    let candidates = [
+        std::env::var("WHISPER_MODEL").ok(),
+        Some("/home/yog/.openfang/models/ggml-base.en.bin".to_string()),
+        Some("/usr/local/share/whisper/ggml-base.en.bin".to_string()),
+    ];
+    for c in candidates.into_iter().flatten() {
+        if std::path::Path::new(&c).exists() {
+            return c;
+        }
+    }
+    "ggml-base.en.bin".to_string()
+}
+
 /// Detect which audio transcription provider is available.
 fn detect_audio_provider() -> Option<&'static str> {
+    // Prefer local whisper.cpp (zero-cost, no API key needed)
+    if which_whisper_cli().is_some() {
+        return Some("local");
+    }
     if std::env::var("GROQ_API_KEY").is_ok() {
         return Some("groq");
     }
@@ -275,6 +424,7 @@ fn default_vision_model(provider: &str) -> &str {
 /// Get the default audio model for a provider.
 fn default_audio_model(provider: &str) -> &str {
     match provider {
+        "local" => "ggml-base.en",
         "groq" => "whisper-large-v3-turbo",
         "openai" => "whisper-1",
         _ => "unknown",

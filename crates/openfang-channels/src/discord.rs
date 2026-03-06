@@ -223,6 +223,16 @@ mod voice {
         }
     }
 
+    impl Clone for AudioReceiver {
+        fn clone(&self) -> Self {
+            Self {
+                buffers: Arc::clone(&self.buffers),
+                ssrc_map: Arc::clone(&self.ssrc_map),
+                tx: self.tx.clone(),
+            }
+        }
+    }
+
     #[async_trait::async_trait]
     impl SongbirdEventHandler for AudioReceiver {
         async fn act(&self, ctx: &EventContext<'_>) -> Option<Event> {
@@ -254,7 +264,7 @@ mod voice {
                         let mut bufs = self.buffers.lock();
                         if let Some(samples) = bufs.remove(&ssrc) {
                             // Only process if we have meaningful audio (>200ms at 48kHz stereo)
-                            if samples.len() > 48000 * 2 / 5 {
+                            if samples.len() > 48000 * 2 {
                                 let user_id = {
                                     let map = self.ssrc_map.lock();
                                     map.get(&ssrc).copied()
@@ -1949,10 +1959,18 @@ impl ChannelAdapter for DiscordAdapter {
                                                                 tokio::sync::mpsc::unbounded_channel::<voice::AudioCompleteEvent>();
                                                             let receiver = voice::AudioReceiver::new(audio_tx);
 
-                                                            // Register receive events
+                                                            // Register all required receive events with cloned receivers
                                                             use songbird::events::{Event as SbEvent, CoreEvent as SbCore};
                                                             manager.register_event(
                                                                 SbEvent::Core(SbCore::VoiceTick),
+                                                                receiver.clone(),
+                                                            );
+                                                            manager.register_event(
+                                                                SbEvent::Core(SbCore::SpeakingStateUpdate),
+                                                                receiver.clone(),
+                                                            );
+                                                            manager.register_event(
+                                                                SbEvent::Core(SbCore::ClientDisconnect),
                                                                 receiver,
                                                             );
 
@@ -1961,6 +1979,9 @@ impl ChannelAdapter for DiscordAdapter {
 
                                                             // Spawn audio processing pipeline
                                                             let vm2 = vm.clone();
+                                                            let api_base = std::env::var("OPENFANG_URL").unwrap_or_else(|_| "http://127.0.0.1:4200".to_string());
+                                                            let api_key = std::env::var("OPENFANG_API_KEY").unwrap_or_else(|_| "ofk-yog-2026".to_string());
+                                                            let default_agent = std::env::var("OPENFANG_DEFAULT_AGENT").unwrap_or_else(|_| "assistant".to_string());
                                                             tokio::spawn(async move {
                                                                 while let Some(evt) = audio_rx.recv().await {
                                                                     let ts = std::time::SystemTime::now()
@@ -1977,30 +1998,32 @@ impl ChannelAdapter for DiscordAdapter {
                                                                     info!("Voice: saved {:.1}s audio from user {uid} to {wav_path}",
                                                                         evt.samples.len() as f64 / 48000.0 / 2.0);
 
-                                                                    // 1) Transcribe via OpenFang API
-                                                                    let stt_body = serde_json::json!({
-                                                                        "tool_name": "speech_to_text",
-                                                                        "input": { "path": &wav_path }
-                                                                    });
-                                                                    let stt_resp = client_clone
-                                                                        .post("http://127.0.0.1:4200/api/tools/execute")
-                                                                        .header("Authorization", "Bearer ofk-yog-2026")
-                                                                        .json(&stt_body)
-                                                                        .send()
+                                                                    // 1) Transcribe locally via whisper-cli
+                                                                    let whisper_model = std::env::var("WHISPER_MODEL")
+                                                                        .unwrap_or_else(|_| "/home/yog/.openfang/models/ggml-base.en.bin".to_string());
+                                                                    let whisper_bin = std::env::var("WHISPER_CLI")
+                                                                        .unwrap_or_else(|_| "/usr/local/bin/whisper-cli".to_string());
+                                                                    let ncpu = std::thread::available_parallelism()
+                                                                        .map(|n| n.get()).unwrap_or(4).min(8);
+                                                                    let stt_output = tokio::process::Command::new(&whisper_bin)
+                                                                        .arg("-m").arg(&whisper_model)
+                                                                        .arg("-f").arg(&wav_path)
+                                                                        .arg("--no-timestamps")
+                                                                        .arg("-np")
+                                                                        .arg("-t").arg(ncpu.to_string())
+                                                                        .output()
                                                                         .await;
-
-                                                                    let transcript = match stt_resp {
-                                                                        Ok(r) => {
-                                                                            let text = r.text().await.unwrap_or_default();
-                                                                            let v: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
-                                                                            v["result"]["transcript"]
-                                                                                .as_str()
-                                                                                .or(v["result"]["description"].as_str())
-                                                                                .unwrap_or("")
-                                                                                .to_string()
+                                                                    let transcript = match stt_output {
+                                                                        Ok(o) if o.status.success() => {
+                                                                            String::from_utf8_lossy(&o.stdout).trim().to_string()
+                                                                        }
+                                                                        Ok(o) => {
+                                                                            error!("Voice STT: whisper-cli exit {}: {}",
+                                                                                o.status, String::from_utf8_lossy(&o.stderr));
+                                                                            String::new()
                                                                         }
                                                                         Err(e) => {
-                                                                            error!("Voice STT failed: {e}");
+                                                                            error!("Voice STT failed to run whisper-cli: {e}");
                                                                             String::new()
                                                                         }
                                                                     };
@@ -2017,8 +2040,8 @@ impl ChannelAdapter for DiscordAdapter {
                                                                         "message": &transcript
                                                                     });
                                                                     let agent_resp = client_clone
-                                                                        .post("http://127.0.0.1:4200/api/agents/assistant/message")
-                                                                        .header("Authorization", "Bearer ofk-yog-2026")
+                                                                        .post(&format!("{api_base}/api/agents/{default_agent}/message"))
+                                                                        .header("Authorization", &format!("Bearer {api_key}"))
                                                                         .json(&msg_body)
                                                                         .send()
                                                                         .await;
@@ -2046,32 +2069,50 @@ impl ChannelAdapter for DiscordAdapter {
                                                                     }
                                                                     info!("Voice agent reply: {reply}");
 
-                                                                    // 3) TTS
-                                                                    let tts_body = serde_json::json!({
-                                                                        "tool_name": "text_to_speech",
-                                                                        "input": { "text": &reply }
-                                                                    });
-                                                                    let tts_resp = client_clone
-                                                                        .post("http://127.0.0.1:4200/api/tools/execute")
-                                                                        .header("Authorization", "Bearer ofk-yog-2026")
-                                                                        .json(&tts_body)
-                                                                        .send()
-                                                                        .await;
-
-                                                                    match tts_resp {
-                                                                        Ok(r) => {
-                                                                            let text = r.text().await.unwrap_or_default();
-                                                                            let v: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
-                                                                            if let Some(audio_path) = v["result"]["saved_to"].as_str() {
-                                                                                if let Some(mut mgr) = vm2.get_mut(&gid) {
-                                                                                    mgr.play_file(audio_path);
+                                                                    // 3) TTS via local Piper (fast, zero-cost)
+                                                                    let piper_bin = std::env::var("PIPER_BIN")
+                                                                        .unwrap_or_else(|_| "/usr/local/bin/piper".to_string());
+                                                                    let piper_model = std::env::var("PIPER_MODEL")
+                                                                        .unwrap_or_else(|_| "/home/yog/.openfang/models/piper/en_US-amy-medium.onnx".to_string());
+                                                                    let tts_path = format!("/tmp/openfang_tts_{ts}.wav");
+                                                                    let tts_output = tokio::process::Command::new(&piper_bin)
+                                                                        .arg("-m").arg(&piper_model)
+                                                                        .arg("-f").arg(&tts_path)
+                                                                        .stdin(std::process::Stdio::piped())
+                                                                        .stdout(std::process::Stdio::null())
+                                                                        .stderr(std::process::Stdio::piped())
+                                                                        .spawn();
+                                                                    match tts_output {
+                                                                        Ok(mut child) => {
+                                                                            // Write reply text to piper's stdin
+                                                                            if let Some(mut stdin) = child.stdin.take() {
+                                                                                use tokio::io::AsyncWriteExt;
+                                                                                let _ = stdin.write_all(reply.as_bytes()).await;
+                                                                                drop(stdin);
+                                                                            }
+                                                                            match child.wait().await {
+                                                                                Ok(status) if status.success() => {
+                                                                                    info!("Voice TTS: piper generated {tts_path}");
+                                                                                    if let Some(mut mgr) = vm2.get_mut(&gid) {
+                                                                                        mgr.play_file(&tts_path);
+                                                                                    }
+                                                                                    // Cleanup after playback
+                                                                                    let p = tts_path.clone();
+                                                                                    tokio::spawn(async move {
+                                                                                        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                                                                                        let _ = std::fs::remove_file(&p);
+                                                                                    });
                                                                                 }
-                                                                            } else {
-                                                                                error!("Voice TTS: no audio path in response");
+                                                                                Ok(status) => {
+                                                                                    error!("Voice TTS: piper exit {status}");
+                                                                                }
+                                                                                Err(e) => {
+                                                                                    error!("Voice TTS: piper wait failed: {e}");
+                                                                                }
                                                                             }
                                                                         }
                                                                         Err(e) => {
-                                                                            error!("Voice TTS failed: {e}");
+                                                                            error!("Voice TTS: failed to spawn piper: {e}");
                                                                         }
                                                                     }
 

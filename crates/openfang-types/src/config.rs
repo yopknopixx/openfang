@@ -1595,7 +1595,7 @@ pub struct DiscordConfig {
     pub allowed_users: Vec<String>,
     /// Default agent name to route messages to.
     pub default_agent: Option<String>,
-    /// Gateway intents bitmask (default: 37376 = GUILD_MESSAGES | DIRECT_MESSAGES | MESSAGE_CONTENT).
+    /// Gateway intents bitmask (default: 37504 = GUILD_MESSAGES | DIRECT_MESSAGES | MESSAGE_CONTENT | GUILD_VOICE_STATES).
     pub intents: u64,
     /// Per-channel behavior overrides.
     #[serde(default)]
@@ -1609,7 +1609,7 @@ impl Default for DiscordConfig {
             allowed_guilds: vec![],
             allowed_users: vec![],
             default_agent: None,
-            intents: 37376,
+            intents: 37504,
             overrides: ChannelOverrides::default(),
         }
     }
@@ -3266,7 +3266,7 @@ mod tests {
         let dc = DiscordConfig::default();
         assert_eq!(dc.bot_token_env, "DISCORD_BOT_TOKEN");
         assert!(dc.allowed_guilds.is_empty());
-        assert_eq!(dc.intents, 37376);
+        assert_eq!(dc.intents, 37504);
     }
 
     #[test]
