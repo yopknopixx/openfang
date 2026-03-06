@@ -6,7 +6,7 @@ license.workspace = true
 description = "Channel Bridge Layer — pluggable messaging integrations for OpenFang"
 
 [dependencies]
-songbird = { version = "0.5", default-features = false, features = ["driver", "receive", "rustls", "tungstenite", "gateway"] }
+songbird = { git = "https://github.com/beerpsi-forks/songbird.git", branch = "davey", default-features = false, features = ["driver", "receive", "rustls", "tungstenite", "gateway"] }
 symphonia = { version = "0.5", features = ["mp3", "wav", "ogg", "pcm"] }
 parking_lot = "0.12"
 openfang-types = { path = "../openfang-types" }

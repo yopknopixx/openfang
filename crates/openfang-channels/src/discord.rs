@@ -297,7 +297,7 @@ mod voice {
     impl SongbirdVoiceManager {
         pub fn new() -> Self {
             let config = SongbirdConfig::default()
-                .decode_mode(DecodeMode::Decode);
+                .decode_mode(DecodeMode::Decode(songbird::driver::DecodeConfig::default()));
 
             Self {
                 driver: Driver::new(config),
